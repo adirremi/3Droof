@@ -2,6 +2,9 @@ import type { GridData, RoofAnalysisResult, RoofPlane } from '../types'
 
 const SQ_M_PER_SQ_FT = 0.09290304
 const FACET_COLORS = ['#38bdf8', '#22c55e', '#f97316', '#a78bfa', '#f43f5e', '#eab308']
+const MIN_PITCH_FOR_FACET_DEGREES = 5
+const MAX_ROOF_HEIGHT_METERS = 12
+const INVALID_Z = Number.NaN
 
 type SlopeSample = {
   pitch: number
@@ -46,7 +49,7 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
 
   const buckets = new Map<string, SlopeSample[]>()
   for (const sample of samples) {
-    if (sample.pitch < 3) {
+    if (sample.pitch < MIN_PITCH_FOR_FACET_DEGREES) {
       continue
     }
 
@@ -82,6 +85,7 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
 
   return {
     grid,
+    maskGrid,
     planes,
     totalAreaSqFt: Math.round(totalAreaSqFt),
     averagePitchDegrees,
@@ -95,19 +99,32 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
   }
 }
 
-export function createMeshGeometry(grid: GridData) {
+export function createMeshGeometry(grid: GridData, maskGrid?: GridData) {
   const vertices: number[] = []
   const indices: number[] = []
-  const scaleZ = 1.8
+  const scaleZ = 1.4
   const xOffset = (grid.width * grid.pixelSizeMeters) / 2
   const yOffset = (grid.height * grid.pixelSizeMeters) / 2
-  const minZ = getMinZ(grid)
+  const baseZ = computeBaseElevation(grid, maskGrid)
+  const usable = new Uint8Array(grid.width * grid.height)
 
   for (let y = 0; y < grid.height; y += 1) {
     for (let x = 0; x < grid.width; x += 1) {
-      const rawValue = getValue(grid, x, y)
-      const z = Number.isFinite(rawValue) ? (rawValue - minZ) * scaleZ : -1
-      vertices.push(x * grid.pixelSizeMeters - xOffset, y * grid.pixelSizeMeters - yOffset, z)
+      const index = y * grid.width + x
+      const rawValue = grid.values[index]
+      const maskValue = maskGrid ? maskGrid.values[index] : 1
+      const isMaskCell = Number.isFinite(maskValue) && maskValue > 0
+      const isFinite = Number.isFinite(rawValue)
+      const height = isFinite ? rawValue - baseZ : 0
+      const cellOk = isMaskCell && isFinite && height >= -0.2 && height <= MAX_ROOF_HEIGHT_METERS
+
+      usable[index] = cellOk ? 1 : 0
+      const z = cellOk ? Math.max(0, height) * scaleZ : INVALID_Z
+      vertices.push(
+        x * grid.pixelSizeMeters - xOffset,
+        y * grid.pixelSizeMeters - yOffset,
+        Number.isFinite(z) ? z : 0,
+      )
     }
   }
 
@@ -118,7 +135,7 @@ export function createMeshGeometry(grid: GridData) {
       const c = a + grid.width
       const d = c + 1
 
-      if ([a, b, c, d].every((index) => Number.isFinite(grid.values[index]))) {
+      if (usable[a] && usable[b] && usable[c] && usable[d]) {
         indices.push(a, c, b, b, c, d)
       }
     }
@@ -128,6 +145,34 @@ export function createMeshGeometry(grid: GridData) {
     vertices,
     indices,
   }
+}
+
+function computeBaseElevation(grid: GridData, maskGrid?: GridData) {
+  const heights: number[] = []
+
+  for (let index = 0; index < grid.values.length; index += 1) {
+    const value = grid.values[index]
+    if (!Number.isFinite(value)) {
+      continue
+    }
+
+    if (maskGrid) {
+      const maskValue = maskGrid.values[index]
+      if (!Number.isFinite(maskValue) || maskValue <= 0) {
+        continue
+      }
+    }
+
+    heights.push(value)
+  }
+
+  if (heights.length === 0) {
+    return 0
+  }
+
+  heights.sort((a, b) => a - b)
+  const lowPercentileIndex = Math.floor(heights.length * 0.05)
+  return heights[lowPercentileIndex]
 }
 
 function scoreConfidence(input: {
@@ -202,18 +247,6 @@ function isCellUsable(grid: GridData, x: number, y: number, maskGrid?: GridData)
 
 function getValue(grid: GridData, x: number, y: number) {
   return grid.values[y * grid.width + x]
-}
-
-function getMinZ(grid: GridData) {
-  let min = Number.POSITIVE_INFINITY
-
-  for (const value of grid.values) {
-    if (Number.isFinite(value)) {
-      min = Math.min(min, value)
-    }
-  }
-
-  return Number.isFinite(min) ? min : 0
 }
 
 function weightedAverage(samples: SlopeSample[], field: 'pitch' | 'azimuth') {

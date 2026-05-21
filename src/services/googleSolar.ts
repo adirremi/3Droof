@@ -199,10 +199,9 @@ export async function fetchSolarPackage(placeId: string): Promise<SolarPackage> 
   assertGoogleKey()
 
   const place = await getPlaceFromMapsLibrary(placeId)
-  const [buildingInsights, dataLayers] = await Promise.all([
-    fetchBuildingInsights(place.location),
-    fetchDataLayers(place.location),
-  ])
+  const buildingInsights = await fetchBuildingInsights(place.location)
+  const radius = computeBuildingRadius(buildingInsights)
+  const dataLayers = await fetchDataLayers(place.location, radius)
 
   const apiKey = normalizeKey(GOOGLE_KEY)!
   const [dsmGrid, maskGrid] = await Promise.all([
@@ -238,14 +237,17 @@ async function fetchBuildingInsights(location: PlaceLocation['location']) {
   return data
 }
 
-async function fetchDataLayers(location: PlaceLocation['location']) {
+async function fetchDataLayers(
+  location: PlaceLocation['location'],
+  radiusMeters = 25,
+) {
   const url = new URL('https://solar.googleapis.com/v1/dataLayers:get')
   url.searchParams.set('location.latitude', location.lat.toString())
   url.searchParams.set('location.longitude', location.lng.toString())
-  url.searchParams.set('radiusMeters', '55')
+  url.searchParams.set('radiusMeters', radiusMeters.toString())
   url.searchParams.set('view', 'FULL_LAYERS')
   url.searchParams.set('requiredQuality', 'MEDIUM')
-  url.searchParams.set('pixelSizeMeters', '0.1')
+  url.searchParams.set('pixelSizeMeters', '0.25')
   url.searchParams.set('key', GOOGLE_KEY!)
 
   const response = await fetch(url)
@@ -293,7 +295,7 @@ function loadGoogleMapsScript() {
     }
 
     const script = document.createElement('script')
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${normalizeKey(GOOGLE_KEY)}&libraries=places&v=weekly`
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${normalizeKey(GOOGLE_KEY)}&libraries=places&language=en&region=US&v=weekly`
     script.async = true
     script.defer = true
     script.dataset.googleMapsLoader = 'true'
@@ -323,6 +325,20 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: 
 
 function normalizeKey(key: string | undefined) {
   return key?.trim().replace(/^['"]|['"]$/g, '')
+}
+
+function computeBuildingRadius(insights: SolarBuildingInsights | undefined) {
+  const box = insights?.boundingBox
+  if (!box) {
+    return 25
+  }
+
+  const latMeters = Math.abs(box.ne.lat - box.sw.lat) * 111_320
+  const avgLat = (box.ne.lat + box.sw.lat) / 2
+  const lngMeters = Math.abs(box.ne.lng - box.sw.lng) * 111_320 * Math.cos((avgLat * Math.PI) / 180)
+  const diagonal = Math.sqrt(latMeters ** 2 + lngMeters ** 2)
+  const radius = Math.max(15, Math.min(45, Math.ceil(diagonal * 0.6)))
+  return radius
 }
 
 function formatPlacesError(error: unknown, referrerHints: string[] = getReferrerHints()) {

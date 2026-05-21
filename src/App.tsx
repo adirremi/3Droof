@@ -202,8 +202,8 @@ function App() {
               <ambientLight intensity={0.8} />
               <directionalLight position={[20, 40, 20]} intensity={1.4} />
               <mesh rotation={[-Math.PI / 2.4, 0, -Math.PI / 5]}>
-                <RoofGeometry grid={analysis.grid} />
-                <meshStandardMaterial color="#38bdf8" roughness={0.55} metalness={0.05} />
+                <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
+                <meshStandardMaterial color="#38bdf8" roughness={0.55} metalness={0.05} flatShading />
               </mesh>
               <gridHelper args={[60, 20, '#94a3b8', '#334155']} />
               <OrbitControls enablePan enableZoom enableRotate />
@@ -333,15 +333,21 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
-function RoofGeometry({ grid }: { grid: RoofAnalysisResult['grid'] }) {
+function RoofGeometry({
+  grid,
+  maskGrid,
+}: {
+  grid: RoofAnalysisResult['grid']
+  maskGrid?: RoofAnalysisResult['maskGrid']
+}) {
   const geometry = useMemo(() => {
-    const mesh = createMeshGeometry(grid)
+    const mesh = createMeshGeometry(grid, maskGrid)
     const nextGeometry = new BufferGeometry()
     nextGeometry.setAttribute('position', new Float32BufferAttribute(mesh.vertices, 3))
     nextGeometry.setIndex(mesh.indices)
     nextGeometry.computeVertexNormals()
     return nextGeometry
-  }, [grid])
+  }, [grid, maskGrid])
 
   return <primitive object={geometry} attach="geometry" />
 }

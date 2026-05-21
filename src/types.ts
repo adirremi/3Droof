@@ -37,6 +37,10 @@ export type SolarDataLayers = {
 export type SolarBuildingInsights = {
   name?: string
   imageryQuality?: string
+  boundingBox?: {
+    sw: LatLng
+    ne: LatLng
+  }
   solarPotential?: {
     roofSegmentStats?: unknown[]
     maxArrayPanelsCount?: number
@@ -76,6 +80,7 @@ export type ConfidenceResult = {
 
 export type RoofAnalysisResult = {
   grid: GridData
+  maskGrid?: GridData
   planes: RoofPlane[]
   totalAreaSqFt: number
   averagePitchDegrees: number
