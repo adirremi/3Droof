@@ -22,7 +22,12 @@ export function getGoogleConfiguration() {
 
 export function getReferrerHints() {
   if (typeof window === 'undefined') {
-    return []
+    return [
+      'https://3-droof.vercel.app/*',
+      'https://*.vercel.app/*',
+      'http://127.0.0.1:5173/*',
+      'http://localhost:5173/*',
+    ]
   }
 
   const { protocol, hostname, port } = window.location
@@ -30,6 +35,8 @@ export function getReferrerHints() {
 
   return [
     `${protocol}//${hostWithPort}/*`,
+    'https://3-droof.vercel.app/*',
+    'https://*.vercel.app/*',
     'http://127.0.0.1:5173/*',
     'http://localhost:5173/*',
   ].filter((value, index, list) => list.indexOf(value) === index)
@@ -119,6 +126,27 @@ export async function getPlaceFromMapsLibrary(placeId: string): Promise<PlaceLoc
   assertGoogleKey()
   await loadGoogleMapsScript()
 
+  try {
+    return await getPlaceWithNewApi(placeId)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (
+      message.includes('GetPlace') ||
+      message.includes('blocked') ||
+      message.includes('PERMISSION_DENIED')
+    ) {
+      try {
+        return await getPlaceWithLegacyApi(placeId)
+      } catch {
+        throw new Error(formatPlacesError(error, getReferrerHints()))
+      }
+    }
+
+    throw new Error(formatPlacesError(error, getReferrerHints()))
+  }
+}
+
+async function getPlaceWithNewApi(placeId: string): Promise<PlaceLocation> {
   const place = new google.maps.places.Place({
     id: placeId,
     requestedRegion: 'us',
@@ -134,6 +162,31 @@ export async function getPlaceFromMapsLibrary(placeId: string): Promise<PlaceLoc
     location: {
       lat: result.place.location.lat(),
       lng: result.place.location.lng(),
+    },
+  }
+}
+
+async function getPlaceWithLegacyApi(placeId: string): Promise<PlaceLocation> {
+  const placesService = new google.maps.places.PlacesService(document.createElement('div'))
+  const result = await new Promise<google.maps.places.PlaceResult>((resolve, reject) => {
+    placesService.getDetails(
+      { placeId, fields: ['formatted_address', 'geometry'] },
+      (place, status) => {
+        if (status === 'OK' && place?.geometry?.location) {
+          resolve(place)
+          return
+        }
+
+        reject(new Error(`Legacy Place Details failed: ${status}`))
+      },
+    )
+  })
+
+  return {
+    address: result.formatted_address ?? placeId,
+    location: {
+      lat: result.geometry!.location!.lat(),
+      lng: result.geometry!.location!.lng(),
     },
   }
 }
@@ -270,12 +323,17 @@ function normalizeKey(key: string | undefined) {
 function formatPlacesError(error: unknown, referrerHints: string[] = getReferrerHints()) {
   const message = error instanceof Error ? error.message : String(error)
 
-  if (message.includes('blocked') || message.includes('AutocompletePlaces')) {
+  if (
+    message.includes('blocked') ||
+    message.includes('AutocompletePlaces') ||
+    message.includes('GetPlace') ||
+    message.includes('PERMISSION_DENIED')
+  ) {
     return [
-      'Google blocked Places Autocomplete for this API key (localhost is OK if referrers match).',
-      `Add these HTTP referrers exactly: ${referrerHints.join(', ')}.`,
-      'Or temporarily set Application restrictions = None and API restrictions = Don\'t restrict key to test.',
-      'API list must include: Places API (New), Maps JavaScript API, Solar API.',
+      'Google blocked Places on this domain. Add ALL of these HTTP referrers to your API key:',
+      referrerHints.join(' | '),
+      'Production: https://3-droof.vercel.app/* and https://*.vercel.app/*',
+      'Local: http://127.0.0.1:5173/* and http://localhost:5173/*',
     ].join(' ')
   }
 

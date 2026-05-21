@@ -40,9 +40,9 @@ Billing must be enabled on the project. If you see `AutocompletePlaces are block
 
 1. Import [github.com/adirremi/3Droof](https://github.com/adirremi/3Droof) in Vercel.
 2. Add environment variable: `VITE_GOOGLE_MAPS_API_KEY` (same value as local).
-3. In Google Cloud key HTTP referrers, also add your Vercel URL, for example:
-   - `https://*.vercel.app/*`
-   - `https://your-project.vercel.app/*`
+3. In Google Cloud key HTTP referrers, also add your Vercel URLs:
+   - `https://3-droof.vercel.app/*`
+   - `https://*.vercel.app/*` (covers preview deployments)
 4. Deploy. Vercel will run `npm run build` and serve the `dist` folder.
 
 ## Current Accuracy Model
