@@ -1,0 +1,287 @@
+import { readGeoTiffGrid } from '../lib/geotiff'
+import type {
+  AddressSuggestion,
+  PlaceLocation,
+  SolarBuildingInsights,
+  SolarDataLayers,
+  SolarPackage,
+} from '../types'
+
+const GOOGLE_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
+let mapsScriptPromise: Promise<void> | undefined
+
+export function getGoogleConfiguration() {
+  const key = normalizeKey(GOOGLE_KEY)
+
+  return {
+    hasGoogleKey: Boolean(key),
+    hasValidKeyShape: Boolean(key?.startsWith('AIza') && key.length > 30),
+    referrerHints: getReferrerHints(),
+  }
+}
+
+export function getReferrerHints() {
+  if (typeof window === 'undefined') {
+    return []
+  }
+
+  const { protocol, hostname, port } = window.location
+  const hostWithPort = port ? `${hostname}:${port}` : hostname
+
+  return [
+    `${protocol}//${hostWithPort}/*`,
+    'http://127.0.0.1:5173/*',
+    'http://localhost:5173/*',
+  ].filter((value, index, list) => list.indexOf(value) === index)
+}
+
+export async function searchPlaces(input: string): Promise<AddressSuggestion[]> {
+  assertGoogleKey()
+  await loadGoogleMapsScript()
+
+  try {
+    return await searchPlacesWithNewApi(input)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.includes('blocked') && !message.includes('AutocompletePlaces')) {
+      throw new Error(formatPlacesError(error))
+    }
+
+    try {
+      return await searchPlacesWithLegacyApi(input)
+    } catch {
+      throw new Error(formatPlacesError(error, getReferrerHints()))
+    }
+  }
+}
+
+async function searchPlacesWithNewApi(input: string) {
+  const request: google.maps.places.AutocompleteRequest = {
+    input,
+    includedRegionCodes: ['us'],
+    locationBias: new google.maps.LatLngBounds(
+      { lat: 24.396308, lng: -87.634938 },
+      { lat: 31.000888, lng: -79.974307 },
+    ),
+    region: 'us',
+    sessionToken: new google.maps.places.AutocompleteSessionToken(),
+  }
+
+  const response = await withTimeout(
+    google.maps.places.AutocompleteSuggestion.fetchAutocompleteSuggestions(request),
+    7000,
+    'Google Places did not respond. Check that the API key is valid and Maps JavaScript API is enabled.',
+  )
+
+  return response.suggestions
+    .map((suggestion) => suggestion.placePrediction)
+    .filter((prediction): prediction is google.maps.places.PlacePrediction => Boolean(prediction))
+    .map((prediction) => ({
+      placeId: prediction.placeId,
+      description: prediction.text.text,
+    }))
+}
+
+async function searchPlacesWithLegacyApi(input: string) {
+  const service = new google.maps.places.AutocompleteService()
+
+  const predictions = await new Promise<google.maps.places.AutocompletePrediction[]>(
+    (resolve, reject) => {
+      service.getPlacePredictions(
+        {
+          input,
+          componentRestrictions: { country: 'us' },
+        },
+        (results, status) => {
+          if (status === 'OK' && results) {
+            resolve(results)
+            return
+          }
+
+          if (status === 'ZERO_RESULTS') {
+            resolve([])
+            return
+          }
+
+          reject(new Error(`Legacy Places autocomplete failed: ${status}`))
+        },
+      )
+    },
+  )
+
+  return predictions.map((prediction) => ({
+    placeId: prediction.place_id,
+    description: prediction.description,
+  }))
+}
+
+export async function getPlaceFromMapsLibrary(placeId: string): Promise<PlaceLocation> {
+  assertGoogleKey()
+  await loadGoogleMapsScript()
+
+  const place = new google.maps.places.Place({
+    id: placeId,
+    requestedRegion: 'us',
+  })
+  const result = await place.fetchFields({ fields: ['formattedAddress', 'location'] })
+
+  if (!result.place.location) {
+    throw new Error('Place Details did not return a location.')
+  }
+
+  return {
+    address: result.place.formattedAddress ?? placeId,
+    location: {
+      lat: result.place.location.lat(),
+      lng: result.place.location.lng(),
+    },
+  }
+}
+
+export async function fetchSolarPackage(placeId: string): Promise<SolarPackage> {
+  assertGoogleKey()
+
+  const place = await getPlaceFromMapsLibrary(placeId)
+  const [buildingInsights, dataLayers] = await Promise.all([
+    fetchBuildingInsights(place.location),
+    fetchDataLayers(place.location),
+  ])
+
+  const [dsmGrid, maskGrid] = await Promise.all([
+    dataLayers?.dsmUrl ? readGeoTiffGrid(dataLayers.dsmUrl) : undefined,
+    dataLayers?.maskUrl ? readGeoTiffGrid(dataLayers.maskUrl) : undefined,
+  ])
+
+  return {
+    place,
+    buildingInsights,
+    dataLayers,
+    dsmGrid,
+    maskGrid,
+  }
+}
+
+async function fetchBuildingInsights(location: PlaceLocation['location']) {
+  const url = new URL('https://solar.googleapis.com/v1/buildingInsights:findClosest')
+  url.searchParams.set('location.latitude', location.lat.toString())
+  url.searchParams.set('location.longitude', location.lng.toString())
+  url.searchParams.set('requiredQuality', 'MEDIUM')
+  url.searchParams.set('key', GOOGLE_KEY!)
+
+  const response = await fetch(url)
+  const data = (await response.json()) as SolarBuildingInsights & {
+    error?: { message?: string }
+  }
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error?.message ?? 'Solar Building Insights did not find a building.')
+  }
+
+  return data
+}
+
+async function fetchDataLayers(location: PlaceLocation['location']) {
+  const url = new URL('https://solar.googleapis.com/v1/dataLayers:get')
+  url.searchParams.set('location.latitude', location.lat.toString())
+  url.searchParams.set('location.longitude', location.lng.toString())
+  url.searchParams.set('radiusMeters', '55')
+  url.searchParams.set('view', 'FULL_LAYERS')
+  url.searchParams.set('requiredQuality', 'MEDIUM')
+  url.searchParams.set('pixelSizeMeters', '0.1')
+  url.searchParams.set('key', GOOGLE_KEY!)
+
+  const response = await fetch(url)
+  const data = (await response.json()) as SolarDataLayers & {
+    error?: { message?: string }
+  }
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error?.message ?? 'Solar Data Layers are unavailable for this address.')
+  }
+
+  return data
+}
+
+function assertGoogleKey() {
+  const key = normalizeKey(GOOGLE_KEY)
+
+  if (!key) {
+    throw new Error('Set VITE_GOOGLE_MAPS_API_KEY to use live Google Places and Solar API data.')
+  }
+
+  if (!key.startsWith('AIza') || key.length <= 30) {
+    throw new Error('VITE_GOOGLE_MAPS_API_KEY does not look like a Google Maps API key. It should start with AIza.')
+  }
+}
+
+function loadGoogleMapsScript() {
+  if (globalThis.google?.maps?.places) {
+    return Promise.resolve()
+  }
+
+  mapsScriptPromise ??= new Promise<void>((resolve, reject) => {
+    ;(globalThis as typeof globalThis & { gm_authFailure?: () => void }).gm_authFailure = () => {
+      reject(new Error('Google Maps authentication failed. Check API restrictions and enabled APIs.'))
+    }
+
+    const existingScript = document.querySelector<HTMLScriptElement>(
+      'script[data-google-maps-loader="true"]',
+    )
+
+    if (existingScript) {
+      existingScript.addEventListener('load', () => resolve())
+      existingScript.addEventListener('error', () => reject(new Error('Google Maps script failed to load.')))
+      return
+    }
+
+    const script = document.createElement('script')
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${normalizeKey(GOOGLE_KEY)}&libraries=places&v=weekly`
+    script.async = true
+    script.defer = true
+    script.dataset.googleMapsLoader = 'true'
+    script.onload = () => resolve()
+    script.onerror = () => reject(new Error('Google Maps script failed to load.'))
+    document.head.appendChild(script)
+  })
+
+  return mapsScriptPromise
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string) {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+
+    promise
+      .then((value) => {
+        window.clearTimeout(timeout)
+        resolve(value)
+      })
+      .catch((error: unknown) => {
+        window.clearTimeout(timeout)
+        reject(error)
+      })
+  })
+}
+
+function normalizeKey(key: string | undefined) {
+  return key?.trim().replace(/^['"]|['"]$/g, '')
+}
+
+function formatPlacesError(error: unknown, referrerHints: string[] = getReferrerHints()) {
+  const message = error instanceof Error ? error.message : String(error)
+
+  if (message.includes('blocked') || message.includes('AutocompletePlaces')) {
+    return [
+      'Google blocked Places Autocomplete for this API key (localhost is OK if referrers match).',
+      `Add these HTTP referrers exactly: ${referrerHints.join(', ')}.`,
+      'Or temporarily set Application restrictions = None and API restrictions = Don\'t restrict key to test.',
+      'API list must include: Places API (New), Maps JavaScript API, Solar API.',
+    ].join(' ')
+  }
+
+  if (message.includes('has not been used') || message.includes('disabled')) {
+    return `${message} Enable "Places API (New)" in the same project as your key, wait 2 minutes, then refresh.`
+  }
+
+  return message
+}
