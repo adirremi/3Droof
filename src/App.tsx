@@ -72,11 +72,15 @@ function App() {
     setLoading(true)
     setMessage(undefined)
     setSuggestions([])
+    setQuery(suggestion.description)
     setSelectedAddress(suggestion.description)
 
     try {
       const nextPackage = await fetchSolarPackage(suggestion.placeId)
       setSolarPackage(nextPackage)
+      const resolvedAddress = nextPackage.place.address
+      setSelectedAddress(resolvedAddress)
+      setQuery(resolvedAddress)
 
       if (nextPackage.dsmGrid) {
         setAnalysis(analyzeDsmRoof(nextPackage.dsmGrid, nextPackage.maskGrid))
@@ -85,7 +89,7 @@ function App() {
 
       setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))
       setMessage(
-        'Google Solar metadata loaded, but DSM download was unavailable in this browser session. Showing sample DSM analysis.',
+        'Solar API responded, but DSM GeoTIFF download failed. If this persists, confirm Solar API is enabled and billing is active.',
       )
     } catch (error) {
       setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))

@@ -8,6 +8,7 @@ import type {
 } from '../types'
 
 const GOOGLE_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
+const PLACES_LANGUAGE = 'en'
 let mapsScriptPromise: Promise<void> | undefined
 
 export function getGoogleConfiguration() {
@@ -66,6 +67,7 @@ async function searchPlacesWithNewApi(input: string) {
   const request: google.maps.places.AutocompleteRequest = {
     input,
     includedRegionCodes: ['us'],
+    language: PLACES_LANGUAGE,
     locationBias: new google.maps.LatLngBounds(
       { lat: 24.396308, lng: -87.634938 },
       { lat: 31.000888, lng: -79.974307 },
@@ -98,6 +100,7 @@ async function searchPlacesWithLegacyApi(input: string) {
         {
           input,
           componentRestrictions: { country: 'us' },
+          language: PLACES_LANGUAGE,
         },
         (results, status) => {
           if (status === 'OK' && results) {
@@ -149,6 +152,7 @@ export async function getPlaceFromMapsLibrary(placeId: string): Promise<PlaceLoc
 async function getPlaceWithNewApi(placeId: string): Promise<PlaceLocation> {
   const place = new google.maps.places.Place({
     id: placeId,
+    requestedLanguage: PLACES_LANGUAGE,
     requestedRegion: 'us',
   })
   const result = await place.fetchFields({ fields: ['formattedAddress', 'location'] })
@@ -200,9 +204,10 @@ export async function fetchSolarPackage(placeId: string): Promise<SolarPackage> 
     fetchDataLayers(place.location),
   ])
 
+  const apiKey = normalizeKey(GOOGLE_KEY)!
   const [dsmGrid, maskGrid] = await Promise.all([
-    dataLayers?.dsmUrl ? readGeoTiffGrid(dataLayers.dsmUrl) : undefined,
-    dataLayers?.maskUrl ? readGeoTiffGrid(dataLayers.maskUrl) : undefined,
+    dataLayers?.dsmUrl ? readGeoTiffGrid(dataLayers.dsmUrl, undefined, apiKey) : undefined,
+    dataLayers?.maskUrl ? readGeoTiffGrid(dataLayers.maskUrl, undefined, apiKey) : undefined,
   ])
 
   return {

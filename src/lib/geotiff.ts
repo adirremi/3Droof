@@ -1,8 +1,12 @@
 import { fromArrayBuffer } from 'geotiff'
 import type { GridData } from '../types'
 
-export async function readGeoTiffGrid(url: string, pixelSizeMeters?: number): Promise<GridData> {
-  const response = await fetch(url)
+export async function readGeoTiffGrid(
+  url: string,
+  pixelSizeMeters?: number,
+  apiKey?: string,
+): Promise<GridData> {
+  const response = await fetch(appendApiKeyIfNeeded(url, apiKey))
 
   if (!response.ok) {
     throw new Error(`Could not download GeoTIFF layer: ${response.status}`)
@@ -34,4 +38,17 @@ export async function readGeoTiffGrid(url: string, pixelSizeMeters?: number): Pr
     noDataValue: noDataValue ?? undefined,
     pixelSizeMeters: fallbackPixelSize,
   }
+}
+
+function appendApiKeyIfNeeded(url: string, apiKey?: string) {
+  if (!apiKey) {
+    return url
+  }
+
+  const parsed = new URL(url)
+  if (!parsed.searchParams.has('key')) {
+    parsed.searchParams.set('key', apiKey)
+  }
+
+  return parsed.toString()
 }
