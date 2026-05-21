@@ -201,7 +201,7 @@ export async function fetchSolarPackage(placeId: string): Promise<SolarPackage> 
   const place = await getPlaceFromMapsLibrary(placeId)
   const buildingInsights = await fetchBuildingInsights(place.location)
   const radius = computeBuildingRadius(buildingInsights)
-  const dataLayers = await fetchDataLayers(place.location, radius)
+  const dataLayers = await fetchDataLayersWithFallback(place.location, radius)
 
   const apiKey = normalizeKey(GOOGLE_KEY)!
   const [dsmGrid, maskGrid] = await Promise.all([
@@ -237,17 +237,54 @@ async function fetchBuildingInsights(location: PlaceLocation['location']) {
   return data
 }
 
+async function fetchDataLayersWithFallback(
+  location: PlaceLocation['location'],
+  preferredRadius: number,
+) {
+  const attempts: Array<{ radius: number; pixelSize: string; quality: string }> = [
+    { radius: clampSolarRadius(preferredRadius), pixelSize: '0.25', quality: 'MEDIUM' },
+    { radius: clampSolarRadius(preferredRadius), pixelSize: '0.5', quality: 'MEDIUM' },
+    { radius: 50, pixelSize: '0.5', quality: 'MEDIUM' },
+    { radius: 50, pixelSize: '1.0', quality: 'LOW' },
+  ]
+
+  let lastError: Error | undefined
+
+  for (const attempt of attempts) {
+    try {
+      return await fetchDataLayers(location, attempt.radius, attempt.pixelSize, attempt.quality)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      const message = lastError.message.toLowerCase()
+      const recoverable =
+        message.includes('invalid argument') ||
+        message.includes('invalid_argument') ||
+        message.includes('unsupported') ||
+        message.includes('pixelsize') ||
+        message.includes('radius')
+
+      if (!recoverable) {
+        throw lastError
+      }
+    }
+  }
+
+  throw lastError ?? new Error('Solar Data Layers are unavailable for this address.')
+}
+
 async function fetchDataLayers(
   location: PlaceLocation['location'],
-  radiusMeters = 25,
+  radiusMeters: number,
+  pixelSizeMeters: string,
+  requiredQuality: string,
 ) {
   const url = new URL('https://solar.googleapis.com/v1/dataLayers:get')
   url.searchParams.set('location.latitude', location.lat.toString())
   url.searchParams.set('location.longitude', location.lng.toString())
   url.searchParams.set('radiusMeters', radiusMeters.toString())
   url.searchParams.set('view', 'FULL_LAYERS')
-  url.searchParams.set('requiredQuality', 'MEDIUM')
-  url.searchParams.set('pixelSizeMeters', '0.25')
+  url.searchParams.set('requiredQuality', requiredQuality)
+  url.searchParams.set('pixelSizeMeters', pixelSizeMeters)
   url.searchParams.set('key', GOOGLE_KEY!)
 
   const response = await fetch(url)
@@ -260,6 +297,13 @@ async function fetchDataLayers(
   }
 
   return data
+}
+
+function clampSolarRadius(radius: number) {
+  if (!Number.isFinite(radius)) {
+    return 30
+  }
+  return Math.max(25, Math.min(100, Math.ceil(radius)))
 }
 
 function assertGoogleKey() {
@@ -330,15 +374,14 @@ function normalizeKey(key: string | undefined) {
 function computeBuildingRadius(insights: SolarBuildingInsights | undefined) {
   const box = insights?.boundingBox
   if (!box) {
-    return 25
+    return 30
   }
 
   const latMeters = Math.abs(box.ne.lat - box.sw.lat) * 111_320
   const avgLat = (box.ne.lat + box.sw.lat) / 2
   const lngMeters = Math.abs(box.ne.lng - box.sw.lng) * 111_320 * Math.cos((avgLat * Math.PI) / 180)
   const diagonal = Math.sqrt(latMeters ** 2 + lngMeters ** 2)
-  const radius = Math.max(15, Math.min(45, Math.ceil(diagonal * 0.6)))
-  return radius
+  return Math.ceil(diagonal * 0.65 + 6)
 }
 
 function formatPlacesError(error: unknown, referrerHints: string[] = getReferrerHints()) {
