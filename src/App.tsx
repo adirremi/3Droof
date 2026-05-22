@@ -198,15 +198,16 @@ function App() {
             <p>{selectedAddress ?? 'Sample DSM is loaded by default.'}</p>
           </div>
           <div className="viewer">
-            <Canvas camera={{ position: [34, 28, 34], fov: 42 }}>
-              <ambientLight intensity={0.8} />
-              <directionalLight position={[20, 40, 20]} intensity={1.4} />
-              <mesh rotation={[-Math.PI / 2.4, 0, -Math.PI / 5]}>
+            <Canvas camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}>
+              <ambientLight intensity={0.7} />
+              <directionalLight position={[40, 80, 30]} intensity={1.3} />
+              <directionalLight position={[-40, 30, -20]} intensity={0.5} />
+              <mesh rotation={[-Math.PI / 2, 0, 0]}>
                 <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
                 <meshStandardMaterial color="#38bdf8" roughness={0.55} metalness={0.05} flatShading />
               </mesh>
-              <gridHelper args={[60, 20, '#94a3b8', '#334155']} />
-              <OrbitControls enablePan enableZoom enableRotate />
+              <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
+              <OrbitControls enablePan enableZoom enableRotate makeDefault />
             </Canvas>
           </div>
         </article>
