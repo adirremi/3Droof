@@ -8,7 +8,7 @@ import {
   Search,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { BufferGeometry, Float32BufferAttribute } from 'three'
+import { BufferGeometry, DoubleSide, Float32BufferAttribute } from 'three'
 import './App.css'
 import { getCostScenario } from './lib/costModel'
 import { analyzeDsmRoof, createMeshGeometry } from './lib/roofAnalysis'
@@ -204,7 +204,13 @@ function App() {
               <directionalLight position={[-40, 30, -20]} intensity={0.5} />
               <mesh rotation={[-Math.PI / 2, 0, 0]}>
                 <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
-                <meshStandardMaterial color="#38bdf8" roughness={0.55} metalness={0.05} flatShading />
+                <meshStandardMaterial
+                  color="#38bdf8"
+                  roughness={0.55}
+                  metalness={0.05}
+                  flatShading
+                  side={DoubleSide}
+                />
               </mesh>
               <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
               <OrbitControls enablePan enableZoom enableRotate makeDefault />

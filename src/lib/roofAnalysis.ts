@@ -200,7 +200,7 @@ export function createMeshGeometry(grid: GridData, maskGrid?: GridData) {
         continue
       }
 
-      indices.push(a, c, b, b, c, d)
+      indices.push(a, b, c, b, d, c)
     }
   }
 
