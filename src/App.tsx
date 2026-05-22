@@ -1,5 +1,5 @@
 import { Canvas } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
+import { Billboard, OrbitControls, Text } from '@react-three/drei'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -186,16 +186,35 @@ function App() {
                 <ambientLight intensity={0.7} />
                 <directionalLight position={[40, 80, 30]} intensity={1.3} />
                 <directionalLight position={[-40, 30, -20]} intensity={0.5} />
-                <mesh rotation={[-Math.PI / 2, 0, 0]}>
-                  <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
-                  <meshStandardMaterial
-                    color="#38bdf8"
-                    roughness={0.55}
-                    metalness={0.05}
-                    flatShading
-                    side={DoubleSide}
-                  />
-                </mesh>
+                <group rotation={[-Math.PI / 2, 0, 0]}>
+                  <mesh>
+                    <RoofGeometry analysis={analysis} />
+                    <meshStandardMaterial
+                      vertexColors
+                      roughness={0.55}
+                      metalness={0.05}
+                      flatShading
+                      side={DoubleSide}
+                    />
+                  </mesh>
+                  {analysis.planes.map((plane) => (
+                    <Billboard
+                      key={plane.id}
+                      position={[plane.centroid.x, plane.centroid.y, plane.centroid.z + 1.2]}
+                    >
+                      <Text
+                        fontSize={1.8}
+                        color="white"
+                        anchorX="center"
+                        anchorY="middle"
+                        outlineColor="#0f172a"
+                        outlineWidth={0.12}
+                      >
+                        {plane.letter}
+                      </Text>
+                    </Billboard>
+                  ))}
+                </group>
                 <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
                 <OrbitControls enablePan enableZoom enableRotate makeDefault />
               </Canvas>
@@ -244,11 +263,17 @@ function App() {
             {analysis?.planes.length ? (
               analysis.planes.map((plane) => (
                 <div className="facet-row" key={plane.id}>
-                  <span className="facet-color" style={{ background: plane.color }} />
+                  <span
+                    className="facet-color"
+                    style={{ background: plane.color }}
+                    aria-hidden
+                  >
+                    {plane.letter}
+                  </span>
                   <strong>{plane.label}</strong>
-                  <span>{plane.areaSqFt.toFixed(0)} sq ft</span>
-                  <span>{plane.pitchDegrees.toFixed(1)} deg pitch</span>
-                  <span>{plane.azimuthDegrees.toFixed(0)} deg azimuth</span>
+                  <span>{Math.round(plane.areaSqFt).toLocaleString()} sq ft</span>
+                  <span>{plane.pitchDegrees.toFixed(1)}° pitch</span>
+                  <span>{plane.azimuthDegrees.toFixed(0)}° azimuth</span>
                 </div>
               ))
             ) : (
@@ -347,21 +372,18 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
-function RoofGeometry({
-  grid,
-  maskGrid,
-}: {
-  grid: RoofAnalysisResult['grid']
-  maskGrid?: RoofAnalysisResult['maskGrid']
-}) {
+function RoofGeometry({ analysis }: { analysis: RoofAnalysisResult }) {
   const geometry = useMemo(() => {
-    const mesh = createMeshGeometry(grid, maskGrid)
+    const mesh = createMeshGeometry(analysis.grid, analysis)
     const nextGeometry = new BufferGeometry()
     nextGeometry.setAttribute('position', new Float32BufferAttribute(mesh.vertices, 3))
+    if (mesh.colors.length === mesh.vertices.length) {
+      nextGeometry.setAttribute('color', new Float32BufferAttribute(mesh.colors, 3))
+    }
     nextGeometry.setIndex(mesh.indices)
     nextGeometry.computeVertexNormals()
     return nextGeometry
-  }, [grid, maskGrid])
+  }, [analysis])
 
   return <primitive object={geometry} attach="geometry" />
 }

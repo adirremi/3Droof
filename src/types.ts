@@ -61,12 +61,19 @@ export type SolarPackage = {
 
 export type RoofPlane = {
   id: string
+  clusterId: number
   label: string
+  letter: string
   color: string
   cellCount: number
   areaSqFt: number
   pitchDegrees: number
   azimuthDegrees: number
+  centroid: {
+    x: number
+    y: number
+    z: number
+  }
 }
 
 export type ConfidenceLevel = 'high' | 'medium' | 'low'
@@ -82,6 +89,13 @@ export type RoofAnalysisResult = {
   grid: GridData
   maskGrid?: GridData
   planes: RoofPlane[]
+  planeAssignments?: Int32Array
+  meshSettings?: {
+    baseZ: number
+    scaleZ: number
+    xOffset: number
+    yOffset: number
+  }
   totalAreaSqFt: number
   averagePitchDegrees: number
   confidence: ConfidenceResult

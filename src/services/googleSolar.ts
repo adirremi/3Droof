@@ -240,8 +240,8 @@ function buildBuildingFootprintMask(
 
   const dxCenterMeters = ((box.ne.lng + box.sw.lng) / 2 - place.lng) * metersPerDegLng
   const dyCenterMeters = ((box.ne.lat + box.sw.lat) / 2 - place.lat) * metersPerDegLat
-  const halfWidthMeters = ((box.ne.lng - box.sw.lng) / 2) * metersPerDegLng + 2.5
-  const halfHeightMeters = ((box.ne.lat - box.sw.lat) / 2) * metersPerDegLat + 2.5
+  const halfWidthMeters = ((box.ne.lng - box.sw.lng) / 2) * metersPerDegLng + 0.5
+  const halfHeightMeters = ((box.ne.lat - box.sw.lat) / 2) * metersPerDegLat + 0.5
 
   const centerX = grid.width / 2 + dxCenterMeters / grid.pixelSizeMeters
   const centerY = grid.height / 2 - dyCenterMeters / grid.pixelSizeMeters
