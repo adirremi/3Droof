@@ -1,6 +1,7 @@
 import { readGeoTiffGrid } from '../lib/geotiff'
 import type {
   AddressSuggestion,
+  GridData,
   PlaceLocation,
   SolarBuildingInsights,
   SolarDataLayers,
@@ -204,17 +205,102 @@ export async function fetchSolarPackage(placeId: string): Promise<SolarPackage> 
   const dataLayers = await fetchDataLayersWithFallback(place.location, radius)
 
   const apiKey = normalizeKey(GOOGLE_KEY)!
-  const [dsmGrid, maskGrid] = await Promise.all([
+  const [rawDsmGrid, rawMaskGrid] = await Promise.all([
     dataLayers?.dsmUrl ? readGeoTiffGrid(dataLayers.dsmUrl, undefined, apiKey) : undefined,
     dataLayers?.maskUrl ? readGeoTiffGrid(dataLayers.maskUrl, undefined, apiKey) : undefined,
   ])
+
+  const cropMask = rawDsmGrid
+    ? buildBuildingFootprintMask(rawDsmGrid, place.location, buildingInsights)
+    : undefined
+  const maskGrid = combineMasks(rawDsmGrid, rawMaskGrid, cropMask)
 
   return {
     place,
     buildingInsights,
     dataLayers,
-    dsmGrid,
+    dsmGrid: rawDsmGrid,
     maskGrid,
+  }
+}
+
+function buildBuildingFootprintMask(
+  grid: GridData,
+  place: PlaceLocation['location'],
+  insights: SolarBuildingInsights | undefined,
+): GridData | undefined {
+  const box = insights?.boundingBox
+  if (!box) {
+    return undefined
+  }
+
+  const avgLat = (box.ne.lat + box.sw.lat) / 2
+  const metersPerDegLat = 111_320
+  const metersPerDegLng = 111_320 * Math.cos((avgLat * Math.PI) / 180)
+
+  const dxCenterMeters = ((box.ne.lng + box.sw.lng) / 2 - place.lng) * metersPerDegLng
+  const dyCenterMeters = ((box.ne.lat + box.sw.lat) / 2 - place.lat) * metersPerDegLat
+  const halfWidthMeters = ((box.ne.lng - box.sw.lng) / 2) * metersPerDegLng + 2.5
+  const halfHeightMeters = ((box.ne.lat - box.sw.lat) / 2) * metersPerDegLat + 2.5
+
+  const centerX = grid.width / 2 + dxCenterMeters / grid.pixelSizeMeters
+  const centerY = grid.height / 2 - dyCenterMeters / grid.pixelSizeMeters
+  const halfWidthPx = halfWidthMeters / grid.pixelSizeMeters
+  const halfHeightPx = halfHeightMeters / grid.pixelSizeMeters
+
+  const values = new Float32Array(grid.width * grid.height)
+  for (let y = 0; y < grid.height; y += 1) {
+    for (let x = 0; x < grid.width; x += 1) {
+      const inside =
+        Math.abs(x + 0.5 - centerX) <= halfWidthPx &&
+        Math.abs(y + 0.5 - centerY) <= halfHeightPx
+      values[y * grid.width + x] = inside ? 1 : 0
+    }
+  }
+
+  return {
+    width: grid.width,
+    height: grid.height,
+    pixelSizeMeters: grid.pixelSizeMeters,
+    values,
+  }
+}
+
+function combineMasks(
+  grid: GridData | undefined,
+  ...masks: (GridData | undefined)[]
+): GridData | undefined {
+  if (!grid) {
+    return undefined
+  }
+
+  const active = masks.filter((mask): mask is GridData => Boolean(mask))
+  if (active.length === 0) {
+    return undefined
+  }
+
+  if (active.length === 1) {
+    return active[0]
+  }
+
+  const values = new Float32Array(grid.width * grid.height)
+  for (let index = 0; index < values.length; index += 1) {
+    let combined = 1
+    for (const mask of active) {
+      const value = mask.values[index]
+      if (!Number.isFinite(value) || value <= 0) {
+        combined = 0
+        break
+      }
+    }
+    values[index] = combined
+  }
+
+  return {
+    width: grid.width,
+    height: grid.height,
+    pixelSizeMeters: grid.pixelSizeMeters,
+    values,
   }
 }
 

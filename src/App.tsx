@@ -105,11 +105,11 @@ function App() {
 
   function handleSampleAnalysis() {
     setSolarPackage(undefined)
-    setSelectedAddress('Sample hip roof, Florida residential property')
+    setSelectedAddress('Sample hip roof (synthetic demo)')
     setMessage(
       config.hasGoogleKey
-        ? 'Running the PoC with synthetic DSM data. Type a Florida address above to use live Google data.'
-        : 'Running the PoC with synthetic DSM data. Add a Google Maps API key for live addresses.',
+        ? 'Demo mode: this is a fake roof generated locally, not the address you typed. Pick a Florida address to use live Google data.'
+        : 'Demo mode: synthetic roof for layout testing. Add a Google Maps API key to query live addresses.',
     )
     setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))
   }
@@ -156,7 +156,7 @@ function App() {
 
           <div className="actions">
             <button type="button" className="primary" onClick={handleSampleAnalysis}>
-              Run sample DSM
+              Load demo roof (synthetic)
             </button>
             <span className={config.hasValidKeyShape ? 'status ok' : 'status warn'}>
               {config.hasValidKeyShape ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
