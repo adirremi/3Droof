@@ -13,6 +13,10 @@ type SlopeSample = {
 export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysisResult {
   const samples: SlopeSample[] = []
   const cellAreaSqFt = (grid.pixelSizeMeters * grid.pixelSizeMeters) / SQ_M_PER_SQ_FT
+  const stats = computeMaskedHeightStats(grid, maskGrid)
+  const heightBuffer = stats ? Math.max(2, (stats.top - stats.base) * 0.4) : Number.POSITIVE_INFINITY
+  const minHeight = stats ? stats.base - Math.max(1, heightBuffer * 0.5) : Number.NEGATIVE_INFINITY
+  const maxHeight = stats ? stats.top + heightBuffer : Number.POSITIVE_INFINITY
   let validCells = 0
   let invalidCells = 0
 
@@ -23,12 +27,27 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
         continue
       }
 
+      if (
+        !isCellUsable(grid, x - 1, y, maskGrid) ||
+        !isCellUsable(grid, x + 1, y, maskGrid) ||
+        !isCellUsable(grid, x, y - 1, maskGrid) ||
+        !isCellUsable(grid, x, y + 1, maskGrid)
+      ) {
+        invalidCells += 1
+        continue
+      }
+
+      const center = getValue(grid, x, y)
       const left = getValue(grid, x - 1, y)
       const right = getValue(grid, x + 1, y)
       const top = getValue(grid, x, y - 1)
       const bottom = getValue(grid, x, y + 1)
 
-      if ([left, right, top, bottom].some((value) => !Number.isFinite(value))) {
+      if (
+        center < minHeight ||
+        center > maxHeight ||
+        Math.max(left, right, top, bottom) - Math.min(left, right, top, bottom) > 6
+      ) {
         invalidCells += 1
         continue
       }
@@ -37,6 +56,12 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
       const dzdy = (bottom - top) / (2 * grid.pixelSizeMeters)
       const slope = Math.sqrt(dzdx ** 2 + dzdy ** 2)
       const pitch = radiansToDegrees(Math.atan(slope))
+
+      if (pitch > 65) {
+        invalidCells += 1
+        continue
+      }
+
       const azimuth = normalizeDegrees(radiansToDegrees(Math.atan2(dzdx, dzdy)))
       const slopeAreaSqFt = cellAreaSqFt * Math.sqrt(1 + slope ** 2)
 
@@ -107,9 +132,11 @@ export function createMeshGeometry(grid: GridData, maskGrid?: GridData) {
   const topZ = stats?.top ?? baseZ + 6
   const heightRange = Math.max(topZ - baseZ, 4)
   const lowerCutoff = baseZ - Math.max(1, heightRange * 0.25)
-  const upperCutoff = topZ + Math.max(1, heightRange * 0.4)
-  const scaleZ = heightRange < 6 ? 1.6 : heightRange < 14 ? 1.0 : 0.55
+  const upperCutoff = topZ + Math.max(2, heightRange * 0.5)
+  const scaleZ = heightRange < 6 ? 1.6 : heightRange < 14 ? 1.1 : 0.7
   const usable = new Uint8Array(grid.width * grid.height)
+  const heights = new Float32Array(grid.width * grid.height)
+  const interior = new Uint8Array(grid.width * grid.height)
 
   for (let y = 0; y < grid.height; y += 1) {
     for (let x = 0; x < grid.width; x += 1) {
@@ -119,10 +146,34 @@ export function createMeshGeometry(grid: GridData, maskGrid?: GridData) {
       const isMaskCell = Number.isFinite(maskValue) && maskValue > 0
       const isFiniteValue = Number.isFinite(rawValue)
       const inHeightWindow = isFiniteValue && rawValue >= lowerCutoff && rawValue <= upperCutoff
-      const cellOk = isMaskCell && isFiniteValue && inHeightWindow
+      usable[index] = isMaskCell && isFiniteValue && inHeightWindow ? 1 : 0
+      heights[index] = isFiniteValue ? rawValue : baseZ
+    }
+  }
 
-      usable[index] = cellOk ? 1 : 0
-      const z = cellOk ? Math.max(0, rawValue - baseZ) * scaleZ : 0
+  for (let y = 1; y < grid.height - 1; y += 1) {
+    for (let x = 1; x < grid.width - 1; x += 1) {
+      const index = y * grid.width + x
+      if (!usable[index]) {
+        continue
+      }
+
+      const neighbors = [
+        usable[index - 1],
+        usable[index + 1],
+        usable[index - grid.width],
+        usable[index + grid.width],
+      ]
+      const neighborOk = neighbors.filter(Boolean).length
+      interior[index] = neighborOk >= 3 ? 1 : 0
+    }
+  }
+
+  for (let y = 0; y < grid.height; y += 1) {
+    for (let x = 0; x < grid.width; x += 1) {
+      const index = y * grid.width + x
+      const inside = interior[index]
+      const z = inside ? Math.max(0, heights[index] - baseZ) * scaleZ : 0
       vertices.push(
         x * grid.pixelSizeMeters - xOffset,
         y * grid.pixelSizeMeters - yOffset,
@@ -138,9 +189,18 @@ export function createMeshGeometry(grid: GridData, maskGrid?: GridData) {
       const c = a + grid.width
       const d = c + 1
 
-      if (usable[a] && usable[b] && usable[c] && usable[d]) {
-        indices.push(a, c, b, b, c, d)
+      const corners = [interior[a], interior[b], interior[c], interior[d]].filter(Boolean).length
+      if (corners < 3) {
+        continue
       }
+
+      const maxHeight = Math.max(heights[a], heights[b], heights[c], heights[d])
+      const minHeight = Math.min(heights[a], heights[b], heights[c], heights[d])
+      if (maxHeight - minHeight > 4) {
+        continue
+      }
+
+      indices.push(a, c, b, b, c, d)
     }
   }
 
