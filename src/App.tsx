@@ -6,12 +6,17 @@ import {
   Loader2,
   MapPin,
   Search,
+  X,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { BufferGeometry, DoubleSide, Float32BufferAttribute } from 'three'
 import './App.css'
 import { getCostScenario } from './lib/costModel'
-import { analyzeDsmRoof, createMeshGeometry } from './lib/roofAnalysis'
+import {
+  analyzeDsmRoof,
+  createMeshGeometry,
+  createPlaneMeshGeometry,
+} from './lib/roofAnalysis'
 import {
   fetchSolarPackage,
   getGoogleConfiguration,
@@ -21,6 +26,7 @@ import type {
   AddressSuggestion,
   CostScenario,
   RoofAnalysisResult,
+  RoofPlane,
   SolarPackage,
 } from './types'
 
@@ -31,11 +37,17 @@ function App() {
   const [selectedAddress, setSelectedAddress] = useState<string>()
   const [solarPackage, setSolarPackage] = useState<SolarPackage>()
   const [analysis, setAnalysis] = useState<RoofAnalysisResult>()
+  const [selectedFacetId, setSelectedFacetId] = useState<string | undefined>()
   const [loading, setLoading] = useState(false)
   const [searching, setSearching] = useState(false)
   const [message, setMessage] = useState<string>()
   const [monthlyProperties, setMonthlyProperties] = useState(100)
   const [commercialFallbackRate, setCommercialFallbackRate] = useState(20)
+
+  const selectedFacet = useMemo(
+    () => analysis?.planes.find((plane) => plane.id === selectedFacetId),
+    [analysis, selectedFacetId],
+  )
 
   const costScenario: CostScenario = useMemo(
     () => getCostScenario(monthlyProperties, commercialFallbackRate),
@@ -86,15 +98,18 @@ function App() {
             roofSegments: nextPackage.buildingInsights?.solarPotential?.roofSegmentStats,
           }),
         )
+        setSelectedFacetId(undefined)
         return
       }
 
       setAnalysis(undefined)
+      setSelectedFacetId(undefined)
       setMessage(
         'Solar API responded, but DSM GeoTIFF download failed. Confirm Solar API is enabled and billing is active, then try again.',
       )
     } catch (error) {
       setAnalysis(undefined)
+      setSelectedFacetId(undefined)
       setMessage(
         error instanceof Error
           ? error.message
@@ -187,42 +202,64 @@ function App() {
           </div>
           <div className="viewer">
             {analysis ? (
-              <Canvas camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}>
-                <ambientLight intensity={0.7} />
-                <directionalLight position={[40, 80, 30]} intensity={1.3} />
-                <directionalLight position={[-40, 30, -20]} intensity={0.5} />
-                <group rotation={[-Math.PI / 2, 0, 0]}>
-                  <mesh>
-                    <RoofGeometry analysis={analysis} />
-                    <meshStandardMaterial
-                      vertexColors
-                      roughness={0.55}
-                      metalness={0.05}
-                      flatShading
-                      side={DoubleSide}
-                    />
-                  </mesh>
-                  {analysis.planes.map((plane) => (
-                    <Billboard
-                      key={plane.id}
-                      position={[plane.centroid.x, plane.centroid.y, plane.centroid.z + 1.2]}
-                    >
-                      <Text
-                        fontSize={1.8}
-                        color="white"
-                        anchorX="center"
-                        anchorY="middle"
-                        outlineColor="#0f172a"
-                        outlineWidth={0.12}
+              <>
+                <Canvas
+                  camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}
+                  onPointerMissed={() => setSelectedFacetId(undefined)}
+                >
+                  <ambientLight intensity={0.7} />
+                  <directionalLight position={[40, 80, 30]} intensity={1.3} />
+                  <directionalLight position={[-40, 30, -20]} intensity={0.5} />
+                  <group rotation={[-Math.PI / 2, 0, 0]}>
+                    {analysis.planes.some((plane) => plane.polygon3D?.length) ? (
+                      analysis.planes.map((plane) => (
+                        <PlaneMesh
+                          key={plane.id}
+                          plane={plane}
+                          isSelected={plane.id === selectedFacetId}
+                          onSelect={() => setSelectedFacetId(plane.id)}
+                        />
+                      ))
+                    ) : (
+                      <mesh>
+                        <RoofGeometry analysis={analysis} />
+                        <meshStandardMaterial
+                          vertexColors
+                          roughness={0.55}
+                          metalness={0.05}
+                          flatShading
+                          side={DoubleSide}
+                        />
+                      </mesh>
+                    )}
+                    {analysis.planes.map((plane) => (
+                      <Billboard
+                        key={`label-${plane.id}`}
+                        position={[plane.centroid.x, plane.centroid.y, plane.centroid.z + 1.2]}
                       >
-                        {plane.letter}
-                      </Text>
-                    </Billboard>
-                  ))}
-                </group>
-                <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
-                <OrbitControls enablePan enableZoom enableRotate makeDefault />
-              </Canvas>
+                        <Text
+                          fontSize={1.6}
+                          color="white"
+                          anchorX="center"
+                          anchorY="middle"
+                          outlineColor="#0f172a"
+                          outlineWidth={0.12}
+                        >
+                          {plane.letter}
+                        </Text>
+                      </Billboard>
+                    ))}
+                  </group>
+                  <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
+                  <OrbitControls enablePan enableZoom enableRotate makeDefault />
+                </Canvas>
+                {selectedFacet && (
+                  <FacetDetailsCard
+                    plane={selectedFacet}
+                    onClose={() => setSelectedFacetId(undefined)}
+                  />
+                )}
+              </>
             ) : (
               <div className="viewer-empty">
                 <MapPin size={28} />
@@ -267,7 +304,12 @@ function App() {
           <div className="facet-list">
             {analysis?.planes.length ? (
               analysis.planes.map((plane) => (
-                <div className="facet-row" key={plane.id}>
+                <button
+                  className={`facet-row${plane.id === selectedFacetId ? ' selected' : ''}`}
+                  key={plane.id}
+                  type="button"
+                  onClick={() => setSelectedFacetId(plane.id)}
+                >
                   <span
                     className="facet-color"
                     style={{ background: plane.color }}
@@ -279,7 +321,7 @@ function App() {
                   <span>{Math.round(plane.areaSqFt).toLocaleString()} sq ft</span>
                   <span>{plane.pitchDegrees.toFixed(1)}° pitch</span>
                   <span>{plane.azimuthDegrees.toFixed(0)}° azimuth</span>
-                </div>
+                </button>
               ))
             ) : (
               <p className="notice">Facets appear after a roof is analyzed.</p>
@@ -391,6 +433,93 @@ function RoofGeometry({ analysis }: { analysis: RoofAnalysisResult }) {
   }, [analysis])
 
   return <primitive object={geometry} attach="geometry" />
+}
+
+function PlaneMesh({
+  plane,
+  isSelected,
+  onSelect,
+}: {
+  plane: RoofPlane
+  isSelected: boolean
+  onSelect: () => void
+}) {
+  const geometry = useMemo(() => {
+    const result = createPlaneMeshGeometry(plane)
+    if (!result) return undefined
+    const next = new BufferGeometry()
+    next.setAttribute('position', new Float32BufferAttribute(result.vertices, 3))
+    next.setIndex(result.indices)
+    next.computeVertexNormals()
+    return next
+  }, [plane])
+
+  if (!geometry) return null
+
+  return (
+    <mesh
+      geometry={geometry}
+      onClick={(event) => {
+        event.stopPropagation()
+        onSelect()
+      }}
+      onPointerOver={(event) => {
+        event.stopPropagation()
+        document.body.style.cursor = 'pointer'
+      }}
+      onPointerOut={() => {
+        document.body.style.cursor = 'auto'
+      }}
+    >
+      <meshStandardMaterial
+        color={plane.color}
+        roughness={0.55}
+        metalness={0.05}
+        flatShading
+        side={DoubleSide}
+        emissive={isSelected ? plane.color : '#000000'}
+        emissiveIntensity={isSelected ? 0.4 : 0}
+      />
+    </mesh>
+  )
+}
+
+function FacetDetailsCard({ plane, onClose }: { plane: RoofPlane; onClose: () => void }) {
+  const sqMeters = (plane.areaSqFt * 0.092903).toFixed(1)
+  return (
+    <div className="facet-card">
+      <button className="facet-card-close" type="button" onClick={onClose} aria-label="Close">
+        <X size={16} />
+      </button>
+      <div className="facet-card-header">
+        <span className="facet-card-color" style={{ background: plane.color }}>
+          {plane.letter}
+        </span>
+        <div>
+          <strong>{plane.label}</strong>
+          <p>Solar API segment</p>
+        </div>
+      </div>
+      <div className="facet-card-grid">
+        <div>
+          <span>Pitch</span>
+          <strong>{plane.pitchDegrees.toFixed(1)}°</strong>
+        </div>
+        <div>
+          <span>Azimuth</span>
+          <strong>{plane.azimuthDegrees.toFixed(0)}°</strong>
+        </div>
+        <div>
+          <span>Area</span>
+          <strong>{Math.round(plane.areaSqFt).toLocaleString()} sq ft</strong>
+        </div>
+        <div>
+          <span>Area (m²)</span>
+          <strong>{sqMeters}</strong>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function CheckItem({ ok, text }: { ok: boolean; text: string }) {

@@ -1,6 +1,8 @@
 import type {
   GridData,
   LatLng,
+  Point2D,
+  Point3D,
   RoofAnalysisResult,
   RoofPlane,
   RoofSegmentStats,
@@ -270,6 +272,32 @@ function analyzeWithSegments(
     cellsByPlane[i] = new Int32Array(cellLists[i])
   }
 
+  // Compute clean polygon per facet using boundary tracing + Douglas-Peucker + azimuth snapping.
+  for (let i = 0; i < planes.length; i += 1) {
+    const plane = planes[i]
+    const cells = cellsByPlane[i]
+    if (!plane.planeEquation || cells.length < MIN_PLANE_CELLS) continue
+    const polygon3D = buildFacetPolygon3D({
+      cells,
+      gridWidth: grid.width,
+      gridHeight: grid.height,
+      pixelSize,
+      xOffset: mesh.xOffset,
+      yOffset: mesh.yOffset,
+      azimuthDeg: plane.azimuthDegrees,
+      planeEq: plane.planeEquation,
+      baseZ: mesh.baseZ,
+      scaleZ: mesh.scaleZ,
+    })
+    if (polygon3D.length >= 3) {
+      plane.polygon3D = polygon3D
+      const cz = polygon3D.reduce((sum, p) => sum + p.z, 0) / polygon3D.length
+      const cxMesh = polygon3D.reduce((sum, p) => sum + p.x, 0) / polygon3D.length
+      const cyMesh = polygon3D.reduce((sum, p) => sum + p.y, 0) / polygon3D.length
+      plane.centroid = { x: cxMesh, y: cyMesh, z: cz }
+    }
+  }
+
   const totalAreaSqFt = planes.reduce((sum, plane) => sum + plane.areaSqFt, 0)
   const averagePitchDegrees =
     totalAreaSqFt > 0
@@ -391,6 +419,237 @@ function morphologicalClose(
   }
 }
 
+type BuildPolygonArgs = {
+  cells: Int32Array
+  gridWidth: number
+  gridHeight: number
+  pixelSize: number
+  xOffset: number
+  yOffset: number
+  azimuthDeg: number
+  planeEq: NonNullable<RoofPlane['planeEquation']>
+  baseZ: number
+  scaleZ: number
+}
+
+function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
+  const {
+    cells,
+    gridWidth,
+    gridHeight,
+    pixelSize,
+    xOffset,
+    yOffset,
+    azimuthDeg,
+    planeEq,
+    baseZ,
+    scaleZ,
+  } = args
+
+  if (cells.length < 4) return []
+
+  const cellSet = new Set<number>()
+  for (let i = 0; i < cells.length; i += 1) cellSet.add(cells[i])
+
+  const isIn = (x: number, y: number) => {
+    if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight) return false
+    return cellSet.has(y * gridWidth + x)
+  }
+
+  // Collect boundary cells (4-connectivity) and compute centroid for angle sorting.
+  const boundary: Point2D[] = []
+  let centroidX = 0
+  let centroidY = 0
+  for (let i = 0; i < cells.length; i += 1) {
+    const idx = cells[i]
+    const x = idx % gridWidth
+    const y = Math.floor(idx / gridWidth)
+    centroidX += x
+    centroidY += y
+    const onEdge =
+      !isIn(x - 1, y) || !isIn(x + 1, y) || !isIn(x, y - 1) || !isIn(x, y + 1)
+    if (onEdge) {
+      boundary.push({
+        x: x * pixelSize - xOffset,
+        y: y * pixelSize - yOffset,
+      })
+    }
+  }
+  if (boundary.length < 3) return []
+
+  const cx = (centroidX / cells.length) * pixelSize - xOffset
+  const cy = (centroidY / cells.length) * pixelSize - yOffset
+
+  // Sort by angle around centroid (works for convex / star-convex shapes, the common case for roof facets).
+  boundary.sort((a, b) => {
+    const angleA = Math.atan2(a.y - cy, a.x - cx)
+    const angleB = Math.atan2(b.y - cy, b.x - cx)
+    return angleA - angleB
+  })
+
+  // Simplify with Douglas-Peucker.
+  const epsilon = pixelSize * 1.6
+  let simplified = douglasPeuckerClosed(boundary, epsilon)
+  if (simplified.length < 3) return []
+
+  // Snap edges to azimuth-aligned directions (parallel to ridge / perpendicular to slope).
+  simplified = snapEdgesToAzimuth(simplified, azimuthDeg)
+  simplified = mergeColinear(simplified, Math.PI / 36, pixelSize * 0.4)
+  if (simplified.length < 3) return []
+
+  // Project polygon vertices onto the precise 3D plane equation from Solar API.
+  const result: Point3D[] = simplified.map((p) => {
+    const worldZ =
+      planeEq.cz -
+      (planeEq.nx * (p.x - planeEq.cxMeters) + planeEq.ny * (p.y - planeEq.cyMeters)) /
+        (planeEq.nz || 1)
+    const meshZ = Math.max(0, worldZ - baseZ) * scaleZ
+    return { x: p.x, y: p.y, z: meshZ }
+  })
+
+  return result
+}
+
+function douglasPeuckerClosed(points: Point2D[], epsilon: number): Point2D[] {
+  if (points.length < 4) return points
+
+  // Choose two extreme anchors (leftmost and rightmost) as the starting split.
+  let leftIdx = 0
+  let rightIdx = 0
+  for (let i = 1; i < points.length; i += 1) {
+    if (points[i].x < points[leftIdx].x) leftIdx = i
+    if (points[i].x > points[rightIdx].x) rightIdx = i
+  }
+  if (leftIdx === rightIdx) return points
+
+  const keep = new Uint8Array(points.length)
+  keep[leftIdx] = 1
+  keep[rightIdx] = 1
+
+  const simplifyRange = (startIdx: number, endIdx: number) => {
+    // Walk from startIdx (exclusive) to endIdx (exclusive) along the polygon ring.
+    const start = points[startIdx]
+    const end = points[endIdx]
+    let maxDist = 0
+    let maxIdx = -1
+    let i = (startIdx + 1) % points.length
+    while (i !== endIdx) {
+      const d = perpDistance(points[i], start, end)
+      if (d > maxDist) {
+        maxDist = d
+        maxIdx = i
+      }
+      i = (i + 1) % points.length
+    }
+    if (maxDist > epsilon && maxIdx !== -1) {
+      keep[maxIdx] = 1
+      simplifyRange(startIdx, maxIdx)
+      simplifyRange(maxIdx, endIdx)
+    }
+  }
+
+  simplifyRange(leftIdx, rightIdx)
+  simplifyRange(rightIdx, leftIdx)
+
+  const result: Point2D[] = []
+  for (let i = 0; i < points.length; i += 1) {
+    if (keep[i]) result.push(points[i])
+  }
+  return result
+}
+
+function perpDistance(p: Point2D, a: Point2D, b: Point2D): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const len2 = dx * dx + dy * dy
+  if (len2 < 1e-9) {
+    const ex = p.x - a.x
+    const ey = p.y - a.y
+    return Math.sqrt(ex * ex + ey * ey)
+  }
+  const num = Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x)
+  return num / Math.sqrt(len2)
+}
+
+function snapEdgesToAzimuth(polygon: Point2D[], azimuthDeg: number): Point2D[] {
+  if (polygon.length < 3) return polygon
+  const azRad = (azimuthDeg * Math.PI) / 180
+  // +y points south, +x east. Azimuth 0° = north => slope direction is (0, -1).
+  // Slope direction (down-slope): (sin(az), -cos(az))
+  const slope = { x: Math.sin(azRad), y: -Math.cos(azRad) }
+  // Perpendicular to slope (along ridge / eave): (-slope.y, slope.x) = (cos(az), sin(az))
+  const perp = { x: Math.cos(azRad), y: Math.sin(azRad) }
+
+  const SNAP_TOL_DEG = 18
+  const snapCos = Math.cos((SNAP_TOL_DEG * Math.PI) / 180)
+
+  // Iterative snap (multiple passes converge as endpoints get shared).
+  const result: Point2D[] = polygon.map((p) => ({ x: p.x, y: p.y }))
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (let i = 0; i < result.length; i += 1) {
+      const a = result[i]
+      const b = result[(i + 1) % result.length]
+      const ex = b.x - a.x
+      const ey = b.y - a.y
+      const elen = Math.sqrt(ex * ex + ey * ey)
+      if (elen < 1e-3) continue
+      const ux = ex / elen
+      const uy = ey / elen
+
+      const dotSlope = Math.abs(ux * slope.x + uy * slope.y)
+      const dotPerp = Math.abs(ux * perp.x + uy * perp.y)
+      let target: Point2D | undefined
+      if (dotPerp > snapCos && dotPerp >= dotSlope) target = perp
+      else if (dotSlope > snapCos) target = slope
+      if (!target) continue
+
+      const sign = ux * target.x + uy * target.y >= 0 ? 1 : -1
+      const midX = (a.x + b.x) / 2
+      const midY = (a.y + b.y) / 2
+      const half = elen / 2
+      result[i] = { x: midX - sign * half * target.x, y: midY - sign * half * target.y }
+      result[(i + 1) % result.length] = {
+        x: midX + sign * half * target.x,
+        y: midY + sign * half * target.y,
+      }
+    }
+  }
+  return result
+}
+
+function mergeColinear(polygon: Point2D[], angleTolRad: number, minEdgeMeters: number): Point2D[] {
+  if (polygon.length < 4) return polygon
+  let current = polygon.slice()
+  let changed = true
+  while (changed && current.length > 3) {
+    changed = false
+    const next: Point2D[] = []
+    for (let i = 0; i < current.length; i += 1) {
+      const prev = current[(i - 1 + current.length) % current.length]
+      const curr = current[i]
+      const nxt = current[(i + 1) % current.length]
+      const ax = curr.x - prev.x
+      const ay = curr.y - prev.y
+      const bx = nxt.x - curr.x
+      const by = nxt.y - curr.y
+      const aLen = Math.sqrt(ax * ax + ay * ay)
+      const bLen = Math.sqrt(bx * bx + by * by)
+      if (aLen < 1e-6 || bLen < 1e-6) continue
+      const dot = (ax * bx + ay * by) / (aLen * bLen)
+      const angle = Math.acos(Math.min(1, Math.max(-1, dot)))
+      const tooShort = aLen < minEdgeMeters || bLen < minEdgeMeters
+      if (angle < angleTolRad || tooShort) {
+        changed = true
+        continue
+      }
+      next.push(curr)
+    }
+    if (next.length < 3) break
+    current = next
+  }
+  return current
+}
+
 function analyzeWithFallbackClustering(
   grid: GridData,
   maskGrid: GridData | undefined,
@@ -473,11 +732,43 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
   const xOffset = settings?.xOffset ?? (grid.width * grid.pixelSizeMeters) / 2
   const yOffset = settings?.yOffset ?? (grid.height * grid.pixelSizeMeters) / 2
 
-  if (analysis?.cellsByPlane && analysis.planes.length > 0) {
-    return createPolygonMesh(grid, analysis, { baseZ, scaleZ, xOffset, yOffset })
+  return createRasterMesh(grid, analysis, { baseZ, scaleZ, xOffset, yOffset })
+}
+
+export function createPlaneMeshGeometry(plane: RoofPlane): {
+  vertices: number[]
+  indices: number[]
+} | null {
+  const polygon = plane.polygon3D
+  if (!polygon || polygon.length < 3) return null
+
+  // Fan-triangulate around the polygon's centroid for robust rendering of slightly concave shapes.
+  let cx = 0
+  let cy = 0
+  let cz = 0
+  for (const point of polygon) {
+    cx += point.x
+    cy += point.y
+    cz += point.z
+  }
+  cx /= polygon.length
+  cy /= polygon.length
+  cz /= polygon.length
+
+  const vertices: number[] = [cx, cy, cz]
+  for (const point of polygon) {
+    vertices.push(point.x, point.y, point.z)
   }
 
-  return createRasterMesh(grid, analysis, { baseZ, scaleZ, xOffset, yOffset })
+  const indices: number[] = []
+  for (let i = 0; i < polygon.length; i += 1) {
+    const a = 0
+    const b = 1 + i
+    const c = 1 + ((i + 1) % polygon.length)
+    indices.push(a, b, c)
+  }
+
+  return { vertices, indices }
 }
 
 type MeshRenderSettings = {
@@ -485,84 +776,6 @@ type MeshRenderSettings = {
   scaleZ: number
   xOffset: number
   yOffset: number
-}
-
-function createPolygonMesh(
-  grid: GridData,
-  analysis: RoofAnalysisResult,
-  { baseZ, scaleZ, xOffset, yOffset }: MeshRenderSettings,
-) {
-  const vertices: number[] = []
-  const colors: number[] = []
-  const indices: number[] = []
-  const pixelSize = grid.pixelSizeMeters
-  const cellsByPlane = analysis.cellsByPlane!
-
-  for (let p = 0; p < analysis.planes.length; p += 1) {
-    const plane = analysis.planes[p]
-    const cells = cellsByPlane[p]
-    const planeEq = plane.planeEquation
-    if (!cells || cells.length < 4 || !planeEq) continue
-
-    const points: Array<{ x: number; y: number }> = []
-    for (let i = 0; i < cells.length; i += 1) {
-      const idx = cells[i]
-      points.push({ x: idx % grid.width, y: Math.floor(idx / grid.width) })
-    }
-
-    const hull = convexHull(points)
-    if (hull.length < 3) continue
-
-    const color = hexToRgb(plane.color)
-    const startVertex = vertices.length / 3
-
-    for (const point of hull) {
-      const meshX = point.x * pixelSize - xOffset
-      const meshY = point.y * pixelSize - yOffset
-      const planeWorldZ =
-        planeEq.cz -
-        (planeEq.nx * (meshX - planeEq.cxMeters) + planeEq.ny * (meshY - planeEq.cyMeters)) /
-          (planeEq.nz || 1)
-      const meshZ = Math.max(0, planeWorldZ - baseZ) * scaleZ
-      vertices.push(meshX, meshY, meshZ)
-      colors.push(color[0], color[1], color[2])
-    }
-
-    for (let i = 1; i < hull.length - 1; i += 1) {
-      indices.push(startVertex, startVertex + i, startVertex + i + 1)
-    }
-  }
-
-  return { vertices, indices, colors }
-}
-
-function convexHull(points: Array<{ x: number; y: number }>) {
-  if (points.length < 3) return points
-  const sorted = [...points].sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x))
-  const cross = (
-    o: { x: number; y: number },
-    a: { x: number; y: number },
-    b: { x: number; y: number },
-  ) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
-
-  const lower: Array<{ x: number; y: number }> = []
-  for (const point of sorted) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
-      lower.pop()
-    }
-    lower.push(point)
-  }
-
-  const upper: Array<{ x: number; y: number }> = []
-  for (let i = sorted.length - 1; i >= 0; i -= 1) {
-    const point = sorted[i]
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
-      upper.pop()
-    }
-    upper.push(point)
-  }
-
-  return [...lower.slice(0, -1), ...upper.slice(0, -1)]
 }
 
 function createRasterMesh(

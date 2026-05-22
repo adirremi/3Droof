@@ -84,6 +84,17 @@ export type PlaneEquation = {
   nz: number
 }
 
+export type Point2D = {
+  x: number
+  y: number
+}
+
+export type Point3D = {
+  x: number
+  y: number
+  z: number
+}
+
 export type RoofPlane = {
   id: string
   clusterId: number
@@ -94,12 +105,9 @@ export type RoofPlane = {
   areaSqFt: number
   pitchDegrees: number
   azimuthDegrees: number
-  centroid: {
-    x: number
-    y: number
-    z: number
-  }
+  centroid: Point3D
   planeEquation?: PlaneEquation
+  polygon3D?: Point3D[]
 }
 
 export type ConfidenceLevel = 'high' | 'medium' | 'low'
