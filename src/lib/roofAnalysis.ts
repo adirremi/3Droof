@@ -112,14 +112,12 @@ function analyzeWithSegments(
     }
   })
 
-  // Hard tolerance: how far a DSM cell may sit from a Solar plane to still count as on it.
-  // Solar Building Insights resolves to ~0.3 m vertical accuracy; DSM noise is ~0.5 m.
-  const PLANE_DISTANCE_TOLERANCE = 1.2
-  // Light spatial weighting only matters when two planes fit the cell equally well.
+  const SOFT_TOLERANCE = 1.6
   const SPATIAL_WEIGHT = 0.04
 
   const planeAssignments = new Int32Array(cellCount)
   planeAssignments.fill(-1)
+  const maskCells = new Uint8Array(cellCount)
   let validCells = 0
   let invalidCells = 0
   const halfWidthMeters = (grid.width * pixelSize) / 2
@@ -142,36 +140,42 @@ function analyzeWithSegments(
         continue
       }
 
+      maskCells[idx] = 1
       const qx = x * pixelSize - halfWidthMeters
       const qz = heights[idx]
 
       let bestScore = Number.POSITIVE_INFINITY
       let bestIndex = -1
+      let bestPlaneDistance = Number.POSITIVE_INFINITY
 
       for (const seg of segmentMeta) {
         const dx = qx - seg.cxMeters
         const dy = qy - seg.cyMeters
         const dz = qz - seg.cz
         const planeDistance = Math.abs(seg.nx * dx + seg.ny * dy + seg.nz * dz)
-        if (planeDistance > PLANE_DISTANCE_TOLERANCE) continue
-
         const spatial = Math.sqrt(dx * dx + dy * dy)
         const score = planeDistance + spatial * SPATIAL_WEIGHT
 
         if (score < bestScore) {
           bestScore = score
           bestIndex = seg.index
+          bestPlaneDistance = planeDistance
         }
       }
 
-      planeAssignments[idx] = bestIndex
-      if (bestIndex !== -1) {
+      if (bestIndex !== -1 && bestPlaneDistance <= SOFT_TOLERANCE) {
+        planeAssignments[idx] = bestIndex
         validCells += 1
       }
     }
   }
 
-  smoothAssignments(planeAssignments, grid.width, grid.height, 1)
+  // Fill in remaining mask cells using nearest assigned neighbor (propagation).
+  fillMaskGapsByPropagation(planeAssignments, maskCells, grid.width, grid.height)
+
+  // Aggressive smoothing for clean facet boundaries.
+  smoothAssignments(planeAssignments, grid.width, grid.height, 4)
+  morphologicalClose(planeAssignments, maskCells, grid.width, grid.height)
 
   const accumulators = segments.map(() => ({
     cellCount: 0,
@@ -231,6 +235,7 @@ function analyzeWithSegments(
 
   const planes: RoofPlane[] = planesUnsorted.map((entry, displayIndex) => {
     const letter = indexToLetter(displayIndex)
+    const meta = segmentMeta[entry.segmentIndex]
     return {
       id: `seg-${entry.segmentIndex}`,
       clusterId: displayIndex,
@@ -242,8 +247,28 @@ function analyzeWithSegments(
       pitchDegrees: entry.plane.pitchDegrees,
       azimuthDegrees: entry.plane.azimuthDegrees,
       centroid: entry.plane.centroid,
+      planeEquation: {
+        cxMeters: meta.cxMeters,
+        cyMeters: meta.cyMeters,
+        cz: meta.cz,
+        nx: meta.nx,
+        ny: meta.ny,
+        nz: meta.nz,
+      },
     }
   })
+
+  // Capture cells per plane after final assignment so we can render clean polygons.
+  const cellsByPlane: Int32Array[] = planes.map(() => new Int32Array(0))
+  const cellLists: number[][] = planes.map(() => [])
+  for (let i = 0; i < cellCount; i += 1) {
+    const planeIdx = planeAssignments[i]
+    if (planeIdx === -1) continue
+    cellLists[planeIdx]?.push(i)
+  }
+  for (let i = 0; i < planes.length; i += 1) {
+    cellsByPlane[i] = new Int32Array(cellLists[i])
+  }
 
   const totalAreaSqFt = planes.reduce((sum, plane) => sum + plane.areaSqFt, 0)
   const averagePitchDegrees =
@@ -256,6 +281,7 @@ function analyzeWithSegments(
     maskGrid,
     planes,
     planeAssignments,
+    cellsByPlane,
     meshSettings: {
       baseZ: mesh.baseZ,
       scaleZ: mesh.scaleZ,
@@ -272,6 +298,96 @@ function analyzeWithSegments(
       hasMask: Boolean(maskGrid),
       usingSegments: true,
     }),
+  }
+}
+
+function fillMaskGapsByPropagation(
+  assignments: Int32Array,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+) {
+  const queue: number[] = []
+  for (let i = 0; i < assignments.length; i += 1) {
+    if (mask[i] && assignments[i] === -1) queue.push(i)
+  }
+  let safety = 0
+  while (queue.length > 0 && safety < 10) {
+    safety += 1
+    const nextRound: number[] = []
+    for (const idx of queue) {
+      if (assignments[idx] !== -1) continue
+      const x = idx % width
+      const y = Math.floor(idx / width)
+      const tally = new Map<number, number>()
+      if (x > 0) addToTally(tally, assignments[idx - 1])
+      if (x < width - 1) addToTally(tally, assignments[idx + 1])
+      if (y > 0) addToTally(tally, assignments[idx - width])
+      if (y < height - 1) addToTally(tally, assignments[idx + width])
+      let bestValue = -1
+      let bestCount = 0
+      for (const [value, count] of tally) {
+        if (count > bestCount) {
+          bestCount = count
+          bestValue = value
+        }
+      }
+      if (bestValue !== -1) {
+        assignments[idx] = bestValue
+      } else {
+        nextRound.push(idx)
+      }
+    }
+    if (nextRound.length === queue.length) break
+    queue.length = 0
+    queue.push(...nextRound)
+  }
+}
+
+function addToTally(tally: Map<number, number>, value: number) {
+  if (value === -1) return
+  tally.set(value, (tally.get(value) ?? 0) + 1)
+}
+
+function morphologicalClose(
+  assignments: Int32Array,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+) {
+  const buffer = new Int32Array(assignments.length)
+  for (let pass = 0; pass < 2; pass += 1) {
+    buffer.set(assignments)
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const idx = y * width + x
+        if (!mask[idx] || assignments[idx] === -1) continue
+        const me = assignments[idx]
+        const neighbors = [
+          assignments[idx - 1],
+          assignments[idx + 1],
+          assignments[idx - width],
+          assignments[idx + width],
+        ]
+        const tally = new Map<number, number>()
+        for (const value of neighbors) {
+          if (value === -1) continue
+          tally.set(value, (tally.get(value) ?? 0) + 1)
+        }
+        let bestValue = me
+        let bestCount = tally.get(me) ?? 0
+        for (const [value, count] of tally) {
+          if (count > bestCount) {
+            bestCount = count
+            bestValue = value
+          }
+        }
+        if (bestCount >= 3 && bestValue !== me) {
+          buffer[idx] = bestValue
+        }
+      }
+    }
+    assignments.set(buffer)
   }
 }
 
@@ -351,16 +467,112 @@ function smoothAssignments(
 }
 
 export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult) {
-  const vertices: number[] = []
-  const colors: number[] = []
-  const indices: number[] = []
-
   const settings = analysis?.meshSettings
   const baseZ = settings?.baseZ ?? 0
   const scaleZ = settings?.scaleZ ?? 1
   const xOffset = settings?.xOffset ?? (grid.width * grid.pixelSizeMeters) / 2
   const yOffset = settings?.yOffset ?? (grid.height * grid.pixelSizeMeters) / 2
 
+  if (analysis?.cellsByPlane && analysis.planes.length > 0) {
+    return createPolygonMesh(grid, analysis, { baseZ, scaleZ, xOffset, yOffset })
+  }
+
+  return createRasterMesh(grid, analysis, { baseZ, scaleZ, xOffset, yOffset })
+}
+
+type MeshRenderSettings = {
+  baseZ: number
+  scaleZ: number
+  xOffset: number
+  yOffset: number
+}
+
+function createPolygonMesh(
+  grid: GridData,
+  analysis: RoofAnalysisResult,
+  { baseZ, scaleZ, xOffset, yOffset }: MeshRenderSettings,
+) {
+  const vertices: number[] = []
+  const colors: number[] = []
+  const indices: number[] = []
+  const pixelSize = grid.pixelSizeMeters
+  const cellsByPlane = analysis.cellsByPlane!
+
+  for (let p = 0; p < analysis.planes.length; p += 1) {
+    const plane = analysis.planes[p]
+    const cells = cellsByPlane[p]
+    const planeEq = plane.planeEquation
+    if (!cells || cells.length < 4 || !planeEq) continue
+
+    const points: Array<{ x: number; y: number }> = []
+    for (let i = 0; i < cells.length; i += 1) {
+      const idx = cells[i]
+      points.push({ x: idx % grid.width, y: Math.floor(idx / grid.width) })
+    }
+
+    const hull = convexHull(points)
+    if (hull.length < 3) continue
+
+    const color = hexToRgb(plane.color)
+    const startVertex = vertices.length / 3
+
+    for (const point of hull) {
+      const meshX = point.x * pixelSize - xOffset
+      const meshY = point.y * pixelSize - yOffset
+      const planeWorldZ =
+        planeEq.cz -
+        (planeEq.nx * (meshX - planeEq.cxMeters) + planeEq.ny * (meshY - planeEq.cyMeters)) /
+          (planeEq.nz || 1)
+      const meshZ = Math.max(0, planeWorldZ - baseZ) * scaleZ
+      vertices.push(meshX, meshY, meshZ)
+      colors.push(color[0], color[1], color[2])
+    }
+
+    for (let i = 1; i < hull.length - 1; i += 1) {
+      indices.push(startVertex, startVertex + i, startVertex + i + 1)
+    }
+  }
+
+  return { vertices, indices, colors }
+}
+
+function convexHull(points: Array<{ x: number; y: number }>) {
+  if (points.length < 3) return points
+  const sorted = [...points].sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x))
+  const cross = (
+    o: { x: number; y: number },
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+  ) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+
+  const lower: Array<{ x: number; y: number }> = []
+  for (const point of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
+      lower.pop()
+    }
+    lower.push(point)
+  }
+
+  const upper: Array<{ x: number; y: number }> = []
+  for (let i = sorted.length - 1; i >= 0; i -= 1) {
+    const point = sorted[i]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
+      upper.pop()
+    }
+    upper.push(point)
+  }
+
+  return [...lower.slice(0, -1), ...upper.slice(0, -1)]
+}
+
+function createRasterMesh(
+  grid: GridData,
+  analysis: RoofAnalysisResult | undefined,
+  { baseZ, scaleZ, xOffset, yOffset }: MeshRenderSettings,
+) {
+  const vertices: number[] = []
+  const colors: number[] = []
+  const indices: number[] = []
   const assignments = analysis?.planeAssignments
   const clusterToColor = new Map<number, [number, number, number]>()
   if (analysis) {
@@ -368,7 +580,6 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
       clusterToColor.set(plane.clusterId, hexToRgb(plane.color))
     }
   }
-
   const heights = extractHeights(grid, baseZ)
 
   for (let y = 0; y < grid.height; y += 1) {
@@ -387,6 +598,8 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
     }
   }
 
+  if (!assignments) return { vertices, indices, colors }
+
   for (let y = 0; y < grid.height - 1; y += 1) {
     for (let x = 0; x < grid.width - 1; x += 1) {
       const a = y * grid.width + x
@@ -394,32 +607,17 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
       const c = a + grid.width
       const d = c + 1
 
-      if (!assignments) continue
-
       const ida = assignments[a]
       const idb = assignments[b]
       const idc = assignments[c]
       const idd = assignments[d]
-
-      if (ida === -1 || idb === -1 || idc === -1 || idd === -1) {
-        continue
-      }
-
-      const minHeight = Math.min(heights[a], heights[b], heights[c], heights[d])
-      const maxHeight = Math.max(heights[a], heights[b], heights[c], heights[d])
-      if (maxHeight - minHeight > 6) {
-        continue
-      }
+      if (ida === -1 || idb === -1 || idc === -1 || idd === -1) continue
 
       indices.push(a, b, c, b, d, c)
     }
   }
 
-  return {
-    vertices,
-    indices,
-    colors,
-  }
+  return { vertices, indices, colors }
 }
 
 function extractHeights(grid: GridData, fallback = 0) {

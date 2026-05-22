@@ -75,6 +75,15 @@ export type SolarPackage = {
   maskGrid?: GridData
 }
 
+export type PlaneEquation = {
+  cxMeters: number
+  cyMeters: number
+  cz: number
+  nx: number
+  ny: number
+  nz: number
+}
+
 export type RoofPlane = {
   id: string
   clusterId: number
@@ -90,6 +99,7 @@ export type RoofPlane = {
     y: number
     z: number
   }
+  planeEquation?: PlaneEquation
 }
 
 export type ConfidenceLevel = 'high' | 'medium' | 'low'
@@ -106,6 +116,7 @@ export type RoofAnalysisResult = {
   maskGrid?: GridData
   planes: RoofPlane[]
   planeAssignments?: Int32Array
+  cellsByPlane?: Int32Array[]
   meshSettings?: {
     baseZ: number
     scaleZ: number
