@@ -304,7 +304,22 @@ function combineMasks(
   }
 }
 
-async function fetchBuildingInsights(location: PlaceLocation['location']) {
+type GoogleLatLng = {
+  latitude?: number
+  longitude?: number
+}
+
+type RawSolarBuildingInsights = Omit<SolarBuildingInsights, 'boundingBox'> & {
+  boundingBox?: {
+    sw?: GoogleLatLng
+    ne?: GoogleLatLng
+  }
+  error?: { message?: string }
+}
+
+async function fetchBuildingInsights(
+  location: PlaceLocation['location'],
+): Promise<SolarBuildingInsights> {
   const url = new URL('https://solar.googleapis.com/v1/buildingInsights:findClosest')
   url.searchParams.set('location.latitude', location.lat.toString())
   url.searchParams.set('location.longitude', location.lng.toString())
@@ -312,15 +327,28 @@ async function fetchBuildingInsights(location: PlaceLocation['location']) {
   url.searchParams.set('key', GOOGLE_KEY!)
 
   const response = await fetch(url)
-  const data = (await response.json()) as SolarBuildingInsights & {
-    error?: { message?: string }
-  }
+  const data = (await response.json()) as RawSolarBuildingInsights
 
   if (!response.ok || data.error) {
     throw new Error(data.error?.message ?? 'Solar Building Insights did not find a building.')
   }
 
-  return data
+  const normalizeLatLng = (point?: GoogleLatLng) => {
+    if (!point || point.latitude === undefined || point.longitude === undefined) {
+      return undefined
+    }
+    return { lat: point.latitude, lng: point.longitude }
+  }
+
+  const sw = normalizeLatLng(data.boundingBox?.sw)
+  const ne = normalizeLatLng(data.boundingBox?.ne)
+
+  return {
+    name: data.name,
+    imageryQuality: data.imageryQuality,
+    boundingBox: sw && ne ? { sw, ne } : undefined,
+    solarPotential: data.solarPotential,
+  }
 }
 
 async function fetchDataLayersWithFallback(

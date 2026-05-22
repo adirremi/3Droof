@@ -12,7 +12,6 @@ import { BufferGeometry, DoubleSide, Float32BufferAttribute } from 'three'
 import './App.css'
 import { getCostScenario } from './lib/costModel'
 import { analyzeDsmRoof, createMeshGeometry } from './lib/roofAnalysis'
-import { createSampleRoofGrid } from './lib/sampleData'
 import {
   fetchSolarPackage,
   getGoogleConfiguration,
@@ -27,13 +26,11 @@ import type {
 
 function App() {
   const config = getGoogleConfiguration()
-  const [query, setQuery] = useState('Miami Beach, FL')
+  const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([])
   const [selectedAddress, setSelectedAddress] = useState<string>()
   const [solarPackage, setSolarPackage] = useState<SolarPackage>()
-  const [analysis, setAnalysis] = useState<RoofAnalysisResult>(() =>
-    analyzeDsmRoof(createSampleRoofGrid()),
-  )
+  const [analysis, setAnalysis] = useState<RoofAnalysisResult>()
   const [loading, setLoading] = useState(false)
   const [searching, setSearching] = useState(false)
   const [message, setMessage] = useState<string>()
@@ -87,31 +84,20 @@ function App() {
         return
       }
 
-      setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))
+      setAnalysis(undefined)
       setMessage(
-        'Solar API responded, but DSM GeoTIFF download failed. If this persists, confirm Solar API is enabled and billing is active.',
+        'Solar API responded, but DSM GeoTIFF download failed. Confirm Solar API is enabled and billing is active, then try again.',
       )
     } catch (error) {
-      setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))
+      setAnalysis(undefined)
       setMessage(
         error instanceof Error
-          ? `${error.message} Showing sample roof analysis instead.`
-          : 'Solar lookup failed. Showing sample roof analysis instead.',
+          ? error.message
+          : 'Solar lookup failed. Please try a different Florida address.',
       )
     } finally {
       setLoading(false)
     }
-  }
-
-  function handleSampleAnalysis() {
-    setSolarPackage(undefined)
-    setSelectedAddress('Sample hip roof (synthetic demo)')
-    setMessage(
-      config.hasGoogleKey
-        ? 'Demo mode: this is a fake roof generated locally, not the address you typed. Pick a Florida address to use live Google data.'
-        : 'Demo mode: synthetic roof for layout testing. Add a Google Maps API key to query live addresses.',
-    )
-    setAnalysis(analyzeDsmRoof(createSampleRoofGrid()))
   }
 
   return (
@@ -155,9 +141,6 @@ function App() {
           )}
 
           <div className="actions">
-            <button type="button" className="primary" onClick={handleSampleAnalysis}>
-              Load demo roof (synthetic)
-            </button>
             <span className={config.hasValidKeyShape ? 'status ok' : 'status warn'}>
               {config.hasValidKeyShape ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
               {config.hasValidKeyShape
@@ -195,26 +178,33 @@ function App() {
         <article className="viewer-card">
           <div className="card-title">
             <h2>3D roof mesh</h2>
-            <p>{selectedAddress ?? 'Sample DSM is loaded by default.'}</p>
+            <p>{selectedAddress ?? 'Pick a Florida address above to render the roof.'}</p>
           </div>
           <div className="viewer">
-            <Canvas camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}>
-              <ambientLight intensity={0.7} />
-              <directionalLight position={[40, 80, 30]} intensity={1.3} />
-              <directionalLight position={[-40, 30, -20]} intensity={0.5} />
-              <mesh rotation={[-Math.PI / 2, 0, 0]}>
-                <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
-                <meshStandardMaterial
-                  color="#38bdf8"
-                  roughness={0.55}
-                  metalness={0.05}
-                  flatShading
-                  side={DoubleSide}
-                />
-              </mesh>
-              <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
-              <OrbitControls enablePan enableZoom enableRotate makeDefault />
-            </Canvas>
+            {analysis ? (
+              <Canvas camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}>
+                <ambientLight intensity={0.7} />
+                <directionalLight position={[40, 80, 30]} intensity={1.3} />
+                <directionalLight position={[-40, 30, -20]} intensity={0.5} />
+                <mesh rotation={[-Math.PI / 2, 0, 0]}>
+                  <RoofGeometry grid={analysis.grid} maskGrid={analysis.maskGrid} />
+                  <meshStandardMaterial
+                    color="#38bdf8"
+                    roughness={0.55}
+                    metalness={0.05}
+                    flatShading
+                    side={DoubleSide}
+                  />
+                </mesh>
+                <gridHelper args={[120, 24, '#94a3b8', '#334155']} />
+                <OrbitControls enablePan enableZoom enableRotate makeDefault />
+              </Canvas>
+            ) : (
+              <div className="viewer-empty">
+                <MapPin size={28} />
+                <p>Select a Florida address to load the live DSM and render its roof.</p>
+              </div>
+            )}
           </div>
         </article>
 
@@ -224,17 +214,23 @@ function App() {
             <p>Computed from DSM cell slopes and plane clusters.</p>
           </div>
 
-          <div className="metric-list">
-            <Metric label="Total roof area" value={`${analysis.totalAreaSqFt.toLocaleString()} sq ft`} />
-            <Metric label="Average pitch" value={`${analysis.averagePitchDegrees.toFixed(1)} deg`} />
-            <Metric label="Detected facets" value={analysis.planes.length.toString()} />
-            <Metric label="Confidence" value={`${analysis.confidence.score}%`} />
-          </div>
+          {analysis ? (
+            <>
+              <div className="metric-list">
+                <Metric label="Total roof area" value={`${analysis.totalAreaSqFt.toLocaleString()} sq ft`} />
+                <Metric label="Average pitch" value={`${analysis.averagePitchDegrees.toFixed(1)} deg`} />
+                <Metric label="Detected facets" value={analysis.planes.length.toString()} />
+                <Metric label="Confidence" value={`${analysis.confidence.score}%`} />
+              </div>
 
-          <div className={`confidence ${analysis.confidence.level}`}>
-            <strong>{analysis.confidence.level.toUpperCase()} confidence</strong>
-            <p>{analysis.confidence.reasons.join(' ')}</p>
-          </div>
+              <div className={`confidence ${analysis.confidence.level}`}>
+                <strong>{analysis.confidence.level.toUpperCase()} confidence</strong>
+                <p>{analysis.confidence.reasons.join(' ')}</p>
+              </div>
+            </>
+          ) : (
+            <p className="notice">Waiting for an address selection to compute measurements.</p>
+          )}
         </article>
       </section>
 
@@ -245,15 +241,19 @@ function App() {
             <p>Plane buckets grouped by pitch and azimuth.</p>
           </div>
           <div className="facet-list">
-            {analysis.planes.map((plane) => (
-              <div className="facet-row" key={plane.id}>
-                <span className="facet-color" style={{ background: plane.color }} />
-                <strong>{plane.label}</strong>
-                <span>{plane.areaSqFt.toFixed(0)} sq ft</span>
-                <span>{plane.pitchDegrees.toFixed(1)} deg pitch</span>
-                <span>{plane.azimuthDegrees.toFixed(0)} deg azimuth</span>
-              </div>
-            ))}
+            {analysis?.planes.length ? (
+              analysis.planes.map((plane) => (
+                <div className="facet-row" key={plane.id}>
+                  <span className="facet-color" style={{ background: plane.color }} />
+                  <strong>{plane.label}</strong>
+                  <span>{plane.areaSqFt.toFixed(0)} sq ft</span>
+                  <span>{plane.pitchDegrees.toFixed(1)} deg pitch</span>
+                  <span>{plane.azimuthDegrees.toFixed(0)} deg azimuth</span>
+                </div>
+              ))
+            ) : (
+              <p className="notice">Facets appear after a roof is analyzed.</p>
+            )}
           </div>
         </article>
 
@@ -318,12 +318,19 @@ function App() {
             <p>When the app should ask for paid measurement data.</p>
           </div>
           <ul className="check-list">
-            {analysis.confidence.fallbackTriggers.map((trigger) => (
-              <li key={trigger}>
+            {analysis?.confidence.fallbackTriggers.length ? (
+              analysis.confidence.fallbackTriggers.map((trigger) => (
+                <li key={trigger}>
+                  <AlertTriangle size={16} />
+                  {trigger}
+                </li>
+              ))
+            ) : (
+              <li>
                 <AlertTriangle size={16} />
-                {trigger}
+                Triggers populate after the first analyzed address.
               </li>
-            ))}
+            )}
           </ul>
         </article>
       </section>
