@@ -80,7 +80,12 @@ function App() {
       setQuery(resolvedAddress)
 
       if (nextPackage.dsmGrid) {
-        setAnalysis(analyzeDsmRoof(nextPackage.dsmGrid, nextPackage.maskGrid))
+        setAnalysis(
+          analyzeDsmRoof(nextPackage.dsmGrid, nextPackage.maskGrid, {
+            place: nextPackage.place.location,
+            roofSegments: nextPackage.buildingInsights?.solarPotential?.roofSegmentStats,
+          }),
+        )
         return
       }
 

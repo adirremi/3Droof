@@ -309,12 +309,52 @@ type GoogleLatLng = {
   longitude?: number
 }
 
-type RawSolarBuildingInsights = Omit<SolarBuildingInsights, 'boundingBox'> & {
+type RawRoofSegment = {
+  pitchDegrees?: number
+  azimuthDegrees?: number
+  stats?: {
+    areaMeters2?: number
+    groundAreaMeters2?: number
+  }
+  center?: GoogleLatLng
   boundingBox?: {
     sw?: GoogleLatLng
     ne?: GoogleLatLng
   }
+  planeHeightAtCenterMeters?: number
+}
+
+type RawSolarBuildingInsights = {
+  name?: string
+  imageryQuality?: string
+  center?: GoogleLatLng
+  boundingBox?: {
+    sw?: GoogleLatLng
+    ne?: GoogleLatLng
+  }
+  solarPotential?: {
+    roofSegmentStats?: RawRoofSegment[]
+    maxArrayPanelsCount?: number
+    wholeRoofStats?: {
+      areaMeters2?: number
+      sunshineQuantiles?: number[]
+    }
+  }
   error?: { message?: string }
+}
+
+const normalizeLatLng = (point?: GoogleLatLng) => {
+  if (!point || point.latitude === undefined || point.longitude === undefined) {
+    return undefined
+  }
+  return { lat: point.latitude, lng: point.longitude }
+}
+
+const normalizeBoundingBox = (box?: { sw?: GoogleLatLng; ne?: GoogleLatLng }) => {
+  if (!box) return undefined
+  const sw = normalizeLatLng(box.sw)
+  const ne = normalizeLatLng(box.ne)
+  return sw && ne ? { sw, ne } : undefined
 }
 
 async function fetchBuildingInsights(
@@ -333,21 +373,24 @@ async function fetchBuildingInsights(
     throw new Error(data.error?.message ?? 'Solar Building Insights did not find a building.')
   }
 
-  const normalizeLatLng = (point?: GoogleLatLng) => {
-    if (!point || point.latitude === undefined || point.longitude === undefined) {
-      return undefined
-    }
-    return { lat: point.latitude, lng: point.longitude }
-  }
-
-  const sw = normalizeLatLng(data.boundingBox?.sw)
-  const ne = normalizeLatLng(data.boundingBox?.ne)
+  const segments = (data.solarPotential?.roofSegmentStats ?? []).map((segment) => ({
+    pitchDegrees: segment.pitchDegrees,
+    azimuthDegrees: segment.azimuthDegrees,
+    stats: segment.stats,
+    center: normalizeLatLng(segment.center),
+    boundingBox: normalizeBoundingBox(segment.boundingBox),
+    planeHeightAtCenterMeters: segment.planeHeightAtCenterMeters,
+  }))
 
   return {
     name: data.name,
     imageryQuality: data.imageryQuality,
-    boundingBox: sw && ne ? { sw, ne } : undefined,
-    solarPotential: data.solarPotential,
+    center: normalizeLatLng(data.center),
+    boundingBox: normalizeBoundingBox(data.boundingBox),
+    solarPotential: {
+      ...data.solarPotential,
+      roofSegmentStats: segments,
+    },
   }
 }
 

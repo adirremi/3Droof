@@ -1,6 +1,13 @@
-import type { GridData, RoofAnalysisResult, RoofPlane } from '../types'
+import type {
+  GridData,
+  LatLng,
+  RoofAnalysisResult,
+  RoofPlane,
+  RoofSegmentStats,
+} from '../types'
 
 const SQ_M_PER_SQ_FT = 0.09290304
+const METERS_PER_DEGREE_LAT = 111_320
 const FACET_COLORS = [
   '#38bdf8',
   '#22c55e',
@@ -12,224 +19,210 @@ const FACET_COLORS = [
   '#ec4899',
   '#84cc16',
   '#fb7185',
+  '#0ea5e9',
+  '#4ade80',
 ]
-const MIN_PLANE_AREA_SQ_FT = 60
-const FLAT_PITCH_DEGREES = 5
-const PITCH_MERGE_DEGREES = 8
-const AZIMUTH_MERGE_DEGREES = 35
-const HEIGHT_MERGE_METERS = 0.8
+const MIN_PLANE_CELLS = 6
+const FALLBACK_COLOR: [number, number, number] = [0.22, 0.74, 0.97]
 
-type SampleMetrics = {
-  pitch: number
-  azimuth: number
-  areaSqFt: number
+type AnalyzeOptions = {
+  place?: LatLng
+  roofSegments?: RoofSegmentStats[]
 }
 
-export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysisResult {
-  const cellCount = grid.width * grid.height
-  const cellAreaSqFt = (grid.pixelSizeMeters * grid.pixelSizeMeters) / SQ_M_PER_SQ_FT
-
+export function analyzeDsmRoof(
+  grid: GridData,
+  maskGrid?: GridData,
+  options?: AnalyzeOptions,
+): RoofAnalysisResult {
   const stats = computeMaskedHeightStats(grid, maskGrid)
   const heightRange = stats ? Math.max(stats.top - stats.base, 4) : 6
-  const minHeight = stats ? stats.base - Math.max(1, heightRange * 0.25) : Number.NEGATIVE_INFINITY
-  const maxHeight = stats ? stats.top + Math.max(2, heightRange * 0.5) : Number.POSITIVE_INFINITY
-
-  const usable = new Uint8Array(cellCount)
-  const pitchGrid = new Float32Array(cellCount)
-  const azimuthGrid = new Float32Array(cellCount)
-  const slopeAreaGrid = new Float32Array(cellCount)
-  const heightGrid = new Float32Array(cellCount)
-  for (let i = 0; i < cellCount; i += 1) {
-    heightGrid[i] = Number.isFinite(grid.values[i]) ? grid.values[i] : Number.NaN
-  }
-
-  let validCells = 0
-  let invalidCells = 0
-
-  for (let y = 1; y < grid.height - 1; y += 1) {
-    for (let x = 1; x < grid.width - 1; x += 1) {
-      const idx = y * grid.width + x
-      if (!isCellUsable(grid, x, y, maskGrid)) {
-        invalidCells += 1
-        continue
-      }
-
-      if (
-        !isCellUsable(grid, x - 1, y, maskGrid) ||
-        !isCellUsable(grid, x + 1, y, maskGrid) ||
-        !isCellUsable(grid, x, y - 1, maskGrid) ||
-        !isCellUsable(grid, x, y + 1, maskGrid)
-      ) {
-        invalidCells += 1
-        continue
-      }
-
-      const center = heightGrid[idx]
-      const left = heightGrid[idx - 1]
-      const right = heightGrid[idx + 1]
-      const top = heightGrid[idx - grid.width]
-      const bottom = heightGrid[idx + grid.width]
-
-      if (
-        center < minHeight ||
-        center > maxHeight ||
-        Math.max(left, right, top, bottom) - Math.min(left, right, top, bottom) > 4
-      ) {
-        invalidCells += 1
-        continue
-      }
-
-      const dzdx = (right - left) / (2 * grid.pixelSizeMeters)
-      const dzdy = (bottom - top) / (2 * grid.pixelSizeMeters)
-      const slope = Math.sqrt(dzdx ** 2 + dzdy ** 2)
-      const pitch = radiansToDegrees(Math.atan(slope))
-
-      if (pitch > 60) {
-        invalidCells += 1
-        continue
-      }
-
-      const azimuth = normalizeDegrees(radiansToDegrees(Math.atan2(dzdx, dzdy)))
-      const slopeAreaSqFt = cellAreaSqFt * Math.sqrt(1 + slope ** 2)
-
-      pitchGrid[idx] = pitch
-      azimuthGrid[idx] = azimuth
-      slopeAreaGrid[idx] = slopeAreaSqFt
-      usable[idx] = 1
-      validCells += 1
-    }
-  }
-
-  const planeAssignments = new Int32Array(cellCount)
-  planeAssignments.fill(-1)
-  let nextClusterId = 0
-  type ClusterAccumulator = {
-    id: number
-    cellCount: number
-    areaSqFt: number
-    sumPitchWeighted: number
-    sumAzimuthSinWeighted: number
-    sumAzimuthCosWeighted: number
-    sumX: number
-    sumY: number
-    sumHeight: number
-  }
-  const clusters: ClusterAccumulator[] = []
-  const queue = new Int32Array(cellCount)
-
-  for (let startIdx = 0; startIdx < cellCount; startIdx += 1) {
-    if (!usable[startIdx] || planeAssignments[startIdx] !== -1) continue
-
-    let head = 0
-    let tail = 0
-    queue[tail++] = startIdx
-    planeAssignments[startIdx] = nextClusterId
-    const cluster: ClusterAccumulator = {
-      id: nextClusterId,
-      cellCount: 0,
-      areaSqFt: 0,
-      sumPitchWeighted: 0,
-      sumAzimuthSinWeighted: 0,
-      sumAzimuthCosWeighted: 0,
-      sumX: 0,
-      sumY: 0,
-      sumHeight: 0,
-    }
-
-    while (head < tail) {
-      const idx = queue[head++]
-      const x = idx % grid.width
-      const y = Math.floor(idx / grid.width)
-      const area = slopeAreaGrid[idx]
-
-      cluster.cellCount += 1
-      cluster.areaSqFt += area
-      cluster.sumPitchWeighted += pitchGrid[idx] * area
-      const azimuthRadians = (azimuthGrid[idx] * Math.PI) / 180
-      cluster.sumAzimuthSinWeighted += Math.sin(azimuthRadians) * area
-      cluster.sumAzimuthCosWeighted += Math.cos(azimuthRadians) * area
-      cluster.sumX += x
-      cluster.sumY += y
-      cluster.sumHeight += heightGrid[idx]
-
-      const candidates: number[] = []
-      if (x > 0) candidates.push(idx - 1)
-      if (x < grid.width - 1) candidates.push(idx + 1)
-      if (y > 0) candidates.push(idx - grid.width)
-      if (y < grid.height - 1) candidates.push(idx + grid.width)
-
-      for (const neighborIdx of candidates) {
-        if (!usable[neighborIdx] || planeAssignments[neighborIdx] !== -1) continue
-        if (!areCellsCompatible(idx, neighborIdx, pitchGrid, azimuthGrid, heightGrid)) continue
-
-        planeAssignments[neighborIdx] = nextClusterId
-        queue[tail++] = neighborIdx
-      }
-    }
-
-    clusters.push(cluster)
-    nextClusterId += 1
-  }
-
   const baseZ = stats?.base ?? 0
   const scaleZ = heightRange < 6 ? 1.6 : heightRange < 14 ? 1.1 : 0.7
   const xOffset = (grid.width * grid.pixelSizeMeters) / 2
   const yOffset = (grid.height * grid.pixelSizeMeters) / 2
 
-  const surviving = clusters
-    .filter((cluster) => cluster.areaSqFt >= MIN_PLANE_AREA_SQ_FT)
-    .sort((a, b) => b.areaSqFt - a.areaSqFt)
+  const usableSegments = (options?.roofSegments ?? []).filter(
+    (segment): segment is RoofSegmentStats & { center: LatLng } => Boolean(segment.center),
+  )
 
-  const survivingIds = new Set(surviving.map((cluster) => cluster.id))
-  for (let i = 0; i < cellCount; i += 1) {
-    if (planeAssignments[i] !== -1 && !survivingIds.has(planeAssignments[i])) {
-      planeAssignments[i] = -1
-    }
+  if (usableSegments.length > 0 && options?.place) {
+    return analyzeWithSegments(grid, maskGrid, options.place, usableSegments, {
+      baseZ,
+      scaleZ,
+      xOffset,
+      yOffset,
+      stats,
+    })
   }
 
-  const planes: RoofPlane[] = surviving.map((cluster, index) => {
-    const avgPitch = cluster.sumPitchWeighted / Math.max(cluster.areaSqFt, 1)
-    const azimuthRadians = Math.atan2(
-      cluster.sumAzimuthSinWeighted / Math.max(cluster.areaSqFt, 1),
-      cluster.sumAzimuthCosWeighted / Math.max(cluster.areaSqFt, 1),
-    )
-    const avgAzimuth = normalizeDegrees(radiansToDegrees(azimuthRadians))
-    const avgX = cluster.sumX / cluster.cellCount
-    const avgY = cluster.sumY / cluster.cellCount
-    const avgHeight = cluster.sumHeight / cluster.cellCount
+  return analyzeWithFallbackClustering(grid, maskGrid, {
+    baseZ,
+    scaleZ,
+    xOffset,
+    yOffset,
+    stats,
+  })
+}
 
-    const meshX = avgX * grid.pixelSizeMeters - xOffset
-    const meshY = avgY * grid.pixelSizeMeters - yOffset
-    const meshZ = Math.max(0, avgHeight - baseZ) * scaleZ
+type MeshGeometryParams = {
+  baseZ: number
+  scaleZ: number
+  xOffset: number
+  yOffset: number
+  stats?: { base: number; top: number }
+}
 
+function analyzeWithSegments(
+  grid: GridData,
+  maskGrid: GridData | undefined,
+  place: LatLng,
+  segments: RoofSegmentStats[],
+  mesh: MeshGeometryParams,
+): RoofAnalysisResult {
+  const cellCount = grid.width * grid.height
+  const heights = extractHeights(grid)
+  const segmentPixels = segments.map((segment, index) => {
+    const center = segment.center!
+    const dxMeters = (center.lng - place.lng) * metersPerDegLng(place.lat)
+    const dyMeters = (center.lat - place.lat) * METERS_PER_DEGREE_LAT
     return {
-      id: `plane-${cluster.id}`,
-      clusterId: cluster.id,
-      letter: indexToLetter(index),
-      label: `Facet ${indexToLetter(index)}`,
-      color: FACET_COLORS[index % FACET_COLORS.length],
-      cellCount: cluster.cellCount,
-      areaSqFt: cluster.areaSqFt,
-      pitchDegrees: avgPitch,
-      azimuthDegrees: avgAzimuth,
-      centroid: { x: meshX, y: meshY, z: meshZ },
+      index,
+      segment,
+      px: grid.width / 2 + dxMeters / grid.pixelSizeMeters,
+      py: grid.height / 2 - dyMeters / grid.pixelSizeMeters,
     }
   })
 
-  let totalAreaSqFt = 0
-  let sumPitchWeighted = 0
-  for (const plane of planes) {
-    totalAreaSqFt += plane.areaSqFt
-    sumPitchWeighted += plane.pitchDegrees * plane.areaSqFt
+  const planeAssignments = new Int32Array(cellCount)
+  planeAssignments.fill(-1)
+  let validCells = 0
+  let invalidCells = 0
+
+  for (let y = 0; y < grid.height; y += 1) {
+    for (let x = 0; x < grid.width; x += 1) {
+      const idx = y * grid.width + x
+      const value = grid.values[idx]
+      const maskValue = maskGrid ? maskGrid.values[idx] : 1
+      const inMask =
+        Number.isFinite(value) &&
+        value !== grid.noDataValue &&
+        Number.isFinite(maskValue) &&
+        maskValue > 0
+
+      if (!inMask) {
+        invalidCells += 1
+        continue
+      }
+
+      let bestIndex = -1
+      let bestDistSq = Number.POSITIVE_INFINITY
+      for (const candidate of segmentPixels) {
+        const dx = x - candidate.px
+        const dy = y - candidate.py
+        const distSq = dx * dx + dy * dy
+        if (distSq < bestDistSq) {
+          bestDistSq = distSq
+          bestIndex = candidate.index
+        }
+      }
+
+      planeAssignments[idx] = bestIndex
+      validCells += 1
+    }
   }
-  const averagePitchDegrees = totalAreaSqFt > 0 ? sumPitchWeighted / totalAreaSqFt : 0
+
+  smoothAssignments(planeAssignments, grid.width, grid.height)
+
+  const accumulators = segments.map(() => ({
+    cellCount: 0,
+    sumX: 0,
+    sumY: 0,
+    sumHeight: 0,
+  }))
+
+  for (let i = 0; i < cellCount; i += 1) {
+    const segmentIndex = planeAssignments[i]
+    if (segmentIndex === -1) continue
+    const x = i % grid.width
+    const y = Math.floor(i / grid.width)
+    accumulators[segmentIndex].cellCount += 1
+    accumulators[segmentIndex].sumX += x
+    accumulators[segmentIndex].sumY += y
+    accumulators[segmentIndex].sumHeight += heights[i]
+  }
+
+  const planesUnsorted = segments
+    .map((segment, segmentIndex) => {
+      const accumulator = accumulators[segmentIndex]
+      if (accumulator.cellCount < MIN_PLANE_CELLS) return undefined
+      const areaSqFt = (segment.stats?.areaMeters2 ?? 0) / SQ_M_PER_SQ_FT
+      const meshX = (accumulator.sumX / accumulator.cellCount) * grid.pixelSizeMeters - mesh.xOffset
+      const meshY = (accumulator.sumY / accumulator.cellCount) * grid.pixelSizeMeters - mesh.yOffset
+      const meshZ = Math.max(
+        0,
+        (accumulator.sumHeight / accumulator.cellCount) - mesh.baseZ,
+      ) * mesh.scaleZ
+      return {
+        segmentIndex,
+        plane: {
+          areaSqFt,
+          pitchDegrees: segment.pitchDegrees ?? 0,
+          azimuthDegrees: segment.azimuthDegrees ?? 0,
+          cellCount: accumulator.cellCount,
+          centroid: { x: meshX, y: meshY, z: meshZ },
+        },
+      }
+    })
+    .filter((entry): entry is Exclude<typeof entry, undefined> => Boolean(entry))
+
+  planesUnsorted.sort((a, b) => b.plane.areaSqFt - a.plane.areaSqFt)
+
+  const remap = new Map<number, number>()
+  planesUnsorted.forEach((entry, displayIndex) => {
+    remap.set(entry.segmentIndex, displayIndex)
+  })
+
+  for (let i = 0; i < cellCount; i += 1) {
+    const original = planeAssignments[i]
+    if (original === -1) continue
+    const remapped = remap.get(original)
+    planeAssignments[i] = remapped !== undefined ? remapped : -1
+  }
+
+  const planes: RoofPlane[] = planesUnsorted.map((entry, displayIndex) => {
+    const letter = indexToLetter(displayIndex)
+    return {
+      id: `seg-${entry.segmentIndex}`,
+      clusterId: displayIndex,
+      label: `Facet ${letter}`,
+      letter,
+      color: FACET_COLORS[displayIndex % FACET_COLORS.length],
+      cellCount: entry.plane.cellCount,
+      areaSqFt: entry.plane.areaSqFt,
+      pitchDegrees: entry.plane.pitchDegrees,
+      azimuthDegrees: entry.plane.azimuthDegrees,
+      centroid: entry.plane.centroid,
+    }
+  })
+
+  const totalAreaSqFt = planes.reduce((sum, plane) => sum + plane.areaSqFt, 0)
+  const averagePitchDegrees =
+    totalAreaSqFt > 0
+      ? planes.reduce((sum, plane) => sum + plane.pitchDegrees * plane.areaSqFt, 0) / totalAreaSqFt
+      : 0
 
   return {
     grid,
     maskGrid,
     planes,
     planeAssignments,
-    meshSettings: { baseZ, scaleZ, xOffset, yOffset },
+    meshSettings: {
+      baseZ: mesh.baseZ,
+      scaleZ: mesh.scaleZ,
+      xOffset: mesh.xOffset,
+      yOffset: mesh.yOffset,
+    },
     totalAreaSqFt: Math.round(totalAreaSqFt),
     averagePitchDegrees,
     confidence: scoreConfidence({
@@ -238,7 +231,83 @@ export function analyzeDsmRoof(grid: GridData, maskGrid?: GridData): RoofAnalysi
       planes,
       averagePitchDegrees,
       hasMask: Boolean(maskGrid),
+      usingSegments: true,
     }),
+  }
+}
+
+function analyzeWithFallbackClustering(
+  grid: GridData,
+  maskGrid: GridData | undefined,
+  mesh: MeshGeometryParams,
+): RoofAnalysisResult {
+  const cellCount = grid.width * grid.height
+  const planeAssignments = new Int32Array(cellCount)
+  planeAssignments.fill(-1)
+
+  return {
+    grid,
+    maskGrid,
+    planes: [],
+    planeAssignments,
+    meshSettings: {
+      baseZ: mesh.baseZ,
+      scaleZ: mesh.scaleZ,
+      xOffset: mesh.xOffset,
+      yOffset: mesh.yOffset,
+    },
+    totalAreaSqFt: 0,
+    averagePitchDegrees: 0,
+    confidence: scoreConfidence({
+      validCells: 0,
+      invalidCells: cellCount,
+      planes: [],
+      averagePitchDegrees: 0,
+      hasMask: Boolean(maskGrid),
+      usingSegments: false,
+    }),
+  }
+}
+
+function smoothAssignments(
+  assignments: Int32Array,
+  width: number,
+  height: number,
+  iterations = 2,
+) {
+  const buffer = new Int32Array(assignments.length)
+  for (let pass = 0; pass < iterations; pass += 1) {
+    buffer.set(assignments)
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const idx = y * width + x
+        const me = assignments[idx]
+        if (me === -1) continue
+        const tally = new Map<number, number>()
+        const neighbors = [
+          assignments[idx - 1],
+          assignments[idx + 1],
+          assignments[idx - width],
+          assignments[idx + width],
+        ]
+        for (const neighbor of neighbors) {
+          if (neighbor === -1) continue
+          tally.set(neighbor, (tally.get(neighbor) ?? 0) + 1)
+        }
+        let bestNeighbor = me
+        let bestCount = tally.get(me) ?? 0
+        for (const [id, count] of tally) {
+          if (count > bestCount) {
+            bestCount = count
+            bestNeighbor = id
+          }
+        }
+        if (bestCount >= 3 && bestNeighbor !== me) {
+          buffer[idx] = bestNeighbor
+        }
+      }
+    }
+    assignments.set(buffer)
   }
 }
 
@@ -246,7 +315,6 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
   const vertices: number[] = []
   const colors: number[] = []
   const indices: number[] = []
-  const cellCount = grid.width * grid.height
 
   const settings = analysis?.meshSettings
   const baseZ = settings?.baseZ ?? 0
@@ -262,28 +330,20 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
     }
   }
 
-  const heights = new Float32Array(cellCount)
-  for (let i = 0; i < cellCount; i += 1) {
-    heights[i] = Number.isFinite(grid.values[i]) ? grid.values[i] : baseZ
-  }
-
-  const fallbackColor: [number, number, number] = [0.22, 0.74, 0.97]
+  const heights = extractHeights(grid, baseZ)
 
   for (let y = 0; y < grid.height; y += 1) {
     for (let x = 0; x < grid.width; x += 1) {
       const idx = y * grid.width + x
       const planeId = assignments ? assignments[idx] : -1
-      const isInPlane = planeId !== -1
-      const z = isInPlane ? Math.max(0, heights[idx] - baseZ) * scaleZ : 0
+      const inPlane = planeId !== -1
+      const z = inPlane ? Math.max(0, heights[idx] - baseZ) * scaleZ : 0
       vertices.push(
         x * grid.pixelSizeMeters - xOffset,
         y * grid.pixelSizeMeters - yOffset,
         z,
       )
-
-      const color = isInPlane
-        ? clusterToColor.get(planeId) ?? fallbackColor
-        : fallbackColor
+      const color = inPlane ? clusterToColor.get(planeId) ?? FALLBACK_COLOR : FALLBACK_COLOR
       colors.push(color[0], color[1], color[2])
     }
   }
@@ -305,7 +365,10 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
       if (ida === -1 || idb === -1 || idc === -1 || idd === -1) {
         continue
       }
-      if (ida !== idb || ida !== idc || ida !== idd) {
+
+      const minHeight = Math.min(heights[a], heights[b], heights[c], heights[d])
+      const maxHeight = Math.max(heights[a], heights[b], heights[c], heights[d])
+      if (maxHeight - minHeight > 6) {
         continue
       }
 
@@ -320,44 +383,16 @@ export function createMeshGeometry(grid: GridData, analysis?: RoofAnalysisResult
   }
 }
 
-function areCellsCompatible(
-  idxA: number,
-  idxB: number,
-  pitchGrid: Float32Array,
-  azimuthGrid: Float32Array,
-  heightGrid: Float32Array,
-) {
-  if (Math.abs(heightGrid[idxA] - heightGrid[idxB]) > HEIGHT_MERGE_METERS) {
-    return false
+function extractHeights(grid: GridData, fallback = 0) {
+  const heights = new Float32Array(grid.values.length)
+  for (let i = 0; i < grid.values.length; i += 1) {
+    heights[i] = Number.isFinite(grid.values[i]) ? grid.values[i] : fallback
   }
-
-  const pitchA = pitchGrid[idxA]
-  const pitchB = pitchGrid[idxB]
-  if (Math.abs(pitchA - pitchB) > PITCH_MERGE_DEGREES) {
-    return false
-  }
-
-  const flatBoth = pitchA < FLAT_PITCH_DEGREES && pitchB < FLAT_PITCH_DEGREES
-  if (flatBoth) {
-    return true
-  }
-
-  const azimuthDelta = Math.abs(azimuthGrid[idxA] - azimuthGrid[idxB])
-  const wrappedDelta = Math.min(azimuthDelta, 360 - azimuthDelta)
-  return wrappedDelta <= AZIMUTH_MERGE_DEGREES
+  return heights
 }
 
-function indexToLetter(index: number) {
-  if (index < 26) {
-    return String.fromCharCode(65 + index)
-  }
-  return `${String.fromCharCode(65 + Math.floor(index / 26) - 1)}${String.fromCharCode(65 + (index % 26))}`
-}
-
-function hexToRgb(hex: string): [number, number, number] {
-  const normalized = hex.replace('#', '')
-  const value = parseInt(normalized, 16)
-  return [((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255]
+function metersPerDegLng(lat: number) {
+  return METERS_PER_DEGREE_LAT * Math.cos((lat * Math.PI) / 180)
 }
 
 function computeMaskedHeightStats(grid: GridData, maskGrid?: GridData) {
@@ -391,6 +426,7 @@ function scoreConfidence(input: {
   planes: RoofPlane[]
   averagePitchDegrees: number
   hasMask: boolean
+  usingSegments: boolean
 }) {
   const totalCells = input.validCells + input.invalidCells
   const validRatio = totalCells > 0 ? input.validCells / totalCells : 0
@@ -400,26 +436,35 @@ function scoreConfidence(input: {
       input.planes.reduce((sum, plane) => sum + plane.areaSqFt, 0),
       1,
     )
-  const complexityPenalty = Math.max(0, input.planes.length - 4) * 5
-  let score = Math.round(validRatio * 65 + (largestPlaneRatio || 0) * 20 + (input.hasMask ? 15 : 5))
-  score = Math.max(8, Math.min(96, score - complexityPenalty))
+  const complexityPenalty = Math.max(0, input.planes.length - 6) * 4
+  let score = Math.round(
+    validRatio * 55 +
+      (largestPlaneRatio || 0) * 15 +
+      (input.hasMask ? 15 : 5) +
+      (input.usingSegments ? 15 : 0),
+  )
+  score = Math.max(10, Math.min(98, score - complexityPenalty))
 
   const fallbackTriggers: string[] = []
   const reasons: string[] = []
 
-  if (validRatio < 0.7) {
+  if (!input.usingSegments) {
+    fallbackTriggers.push('Solar API roof segments were not available. Coverage may be limited.')
+    reasons.push('Solar API did not return roof segments.')
+  }
+
+  if (validRatio < 0.6) {
     fallbackTriggers.push('DSM has too many invalid or masked cells.')
     reasons.push('DSM coverage is incomplete.')
   }
 
-  if (input.planes.length > 8) {
-    fallbackTriggers.push('Roof has many small facets and may need paid measurement verification.')
-    reasons.push('Geometry is complex.')
+  if (input.planes.length === 0) {
+    fallbackTriggers.push('No roof facets were detected. Verify the address.')
+    reasons.push('No facets detected for this property.')
   }
 
-  if (input.planes.length === 0) {
-    fallbackTriggers.push('No facets were detected. Verify the address and Solar API coverage.')
-    reasons.push('No roof facets detected.')
+  if (input.planes.length > 10) {
+    reasons.push('Roof has many facets — verify by hand if measurements are critical.')
   }
 
   if (!input.hasMask) {
@@ -432,35 +477,28 @@ function scoreConfidence(input: {
   }
 
   if (reasons.length === 0) {
-    reasons.push('DSM coverage and plane grouping look stable for an automated estimate.')
+    reasons.push('Solar segments matched DSM cleanly; estimates should be reliable.')
   }
 
   return {
-    level: score >= 78 ? 'high' : score >= 52 ? 'medium' : 'low',
+    level: score >= 75 ? 'high' : score >= 50 ? 'medium' : 'low',
     score,
     reasons,
     fallbackTriggers,
   } as const
 }
 
-function isCellUsable(grid: GridData, x: number, y: number, maskGrid?: GridData) {
-  const value = grid.values[y * grid.width + x]
-  const mask = maskGrid ? maskGrid.values[y * maskGrid.width + x] : 1
-  return (
-    Number.isFinite(value) &&
-    value !== grid.noDataValue &&
-    Number.isFinite(mask) &&
-    mask > 0
-  )
+function indexToLetter(index: number) {
+  if (index < 26) {
+    return String.fromCharCode(65 + index)
+  }
+  return `${String.fromCharCode(65 + Math.floor(index / 26) - 1)}${String.fromCharCode(
+    65 + (index % 26),
+  )}`
 }
 
-function radiansToDegrees(radians: number) {
-  return (radians * 180) / Math.PI
+function hexToRgb(hex: string): [number, number, number] {
+  const normalized = hex.replace('#', '')
+  const value = parseInt(normalized, 16)
+  return [((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255]
 }
-
-function normalizeDegrees(degrees: number) {
-  return (degrees + 360) % 360
-}
-
-// Sample shape kept for backward-compatibility with previous callers (none active).
-export type { SampleMetrics }

@@ -34,15 +34,31 @@ export type SolarDataLayers = {
   }
 }
 
+export type RoofSegmentStats = {
+  pitchDegrees?: number
+  azimuthDegrees?: number
+  stats?: {
+    areaMeters2?: number
+    groundAreaMeters2?: number
+  }
+  center?: LatLng
+  boundingBox?: {
+    sw: LatLng
+    ne: LatLng
+  }
+  planeHeightAtCenterMeters?: number
+}
+
 export type SolarBuildingInsights = {
   name?: string
   imageryQuality?: string
+  center?: LatLng
   boundingBox?: {
     sw: LatLng
     ne: LatLng
   }
   solarPotential?: {
-    roofSegmentStats?: unknown[]
+    roofSegmentStats?: RoofSegmentStats[]
     maxArrayPanelsCount?: number
     wholeRoofStats?: {
       areaMeters2?: number
