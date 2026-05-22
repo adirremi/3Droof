@@ -82,17 +82,27 @@ function analyzeWithSegments(
 ): RoofAnalysisResult {
   const cellCount = grid.width * grid.height
   const heights = extractHeights(grid)
-  const segmentPixels = segments.map((segment, index) => {
+
+  const segmentMeta = segments.map((segment, index) => {
     const center = segment.center!
     const dxMeters = (center.lng - place.lng) * metersPerDegLng(place.lat)
     const dyMeters = (center.lat - place.lat) * METERS_PER_DEGREE_LAT
+    const pitchRad = ((segment.pitchDegrees ?? 0) * Math.PI) / 180
+    const azRad = ((segment.azimuthDegrees ?? 0) * Math.PI) / 180
+    const sinP = Math.sin(pitchRad)
+    const cosP = Math.cos(pitchRad)
     return {
       index,
       segment,
       px: grid.width / 2 + dxMeters / grid.pixelSizeMeters,
       py: grid.height / 2 - dyMeters / grid.pixelSizeMeters,
+      isFlat: (segment.pitchDegrees ?? 0) < 5,
+      planeHeight: segment.planeHeightAtCenterMeters,
+      normal: [sinP * Math.sin(azRad), -sinP * Math.cos(azRad), cosP] as [number, number, number],
     }
   })
+
+  const localNormals = computeLocalNormals(grid, maskGrid)
 
   const planeAssignments = new Int32Array(cellCount)
   planeAssignments.fill(-1)
@@ -115,14 +125,34 @@ function analyzeWithSegments(
         continue
       }
 
+      const cellNormal = localNormals[idx]
       let bestIndex = -1
-      let bestDistSq = Number.POSITIVE_INFINITY
-      for (const candidate of segmentPixels) {
+      let bestScore = Number.POSITIVE_INFINITY
+      for (const candidate of segmentMeta) {
         const dx = x - candidate.px
         const dy = y - candidate.py
-        const distSq = dx * dx + dy * dy
-        if (distSq < bestDistSq) {
-          bestDistSq = distSq
+        const spatial = Math.sqrt(dx * dx + dy * dy)
+        const normalizedSpatial = Math.min(spatial / 40, 1.5)
+
+        let orientationCost = 0
+        if (cellNormal) {
+          const dot =
+            cellNormal[0] * candidate.normal[0] +
+            cellNormal[1] * candidate.normal[1] +
+            cellNormal[2] * candidate.normal[2]
+          orientationCost = 1 - Math.max(-1, Math.min(1, dot))
+        } else {
+          orientationCost = candidate.isFlat ? 0.2 : 0.6
+        }
+
+        let heightCost = 0
+        if (candidate.planeHeight !== undefined) {
+          heightCost = Math.min(Math.abs(heights[idx] - candidate.planeHeight) / 3, 1)
+        }
+
+        const score = orientationCost * 3.5 + normalizedSpatial * 0.6 + heightCost * 0.8
+        if (score < bestScore) {
+          bestScore = score
           bestIndex = candidate.index
         }
       }
@@ -132,7 +162,7 @@ function analyzeWithSegments(
     }
   }
 
-  smoothAssignments(planeAssignments, grid.width, grid.height)
+  smoothAssignments(planeAssignments, grid.width, grid.height, 3)
 
   const accumulators = segments.map(() => ({
     cellCount: 0,
@@ -389,6 +419,53 @@ function extractHeights(grid: GridData, fallback = 0) {
     heights[i] = Number.isFinite(grid.values[i]) ? grid.values[i] : fallback
   }
   return heights
+}
+
+function computeLocalNormals(
+  grid: GridData,
+  maskGrid: GridData | undefined,
+): Array<[number, number, number] | null> {
+  const result: Array<[number, number, number] | null> = new Array(grid.values.length).fill(null)
+  const isUsable = (idx: number) => {
+    const value = grid.values[idx]
+    const maskValue = maskGrid ? maskGrid.values[idx] : 1
+    return (
+      Number.isFinite(value) &&
+      value !== grid.noDataValue &&
+      Number.isFinite(maskValue) &&
+      maskValue > 0
+    )
+  }
+
+  for (let y = 1; y < grid.height - 1; y += 1) {
+    for (let x = 1; x < grid.width - 1; x += 1) {
+      const idx = y * grid.width + x
+      if (!isUsable(idx)) continue
+      if (
+        !isUsable(idx - 1) ||
+        !isUsable(idx + 1) ||
+        !isUsable(idx - grid.width) ||
+        !isUsable(idx + grid.width)
+      ) {
+        continue
+      }
+
+      const left = grid.values[idx - 1]
+      const right = grid.values[idx + 1]
+      const top = grid.values[idx - grid.width]
+      const bottom = grid.values[idx + grid.width]
+
+      const dzdx = (right - left) / (2 * grid.pixelSizeMeters)
+      const dzdy = (bottom - top) / (2 * grid.pixelSizeMeters)
+      const nx = -dzdx
+      const ny = -dzdy
+      const nz = 1
+      const norm = Math.sqrt(nx * nx + ny * ny + nz * nz)
+      result[idx] = [nx / norm, ny / norm, nz / norm]
+    }
+  }
+
+  return result
 }
 
 function metersPerDegLng(lat: number) {
