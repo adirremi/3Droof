@@ -38,9 +38,9 @@ export function analyzeDsmRoof(
   options?: AnalyzeOptions,
 ): RoofAnalysisResult {
   const stats = computeMaskedHeightStats(grid, maskGrid)
-  const heightRange = stats ? Math.max(stats.top - stats.base, 4) : 6
   const baseZ = stats?.base ?? 0
-  const scaleZ = heightRange < 6 ? 1.6 : heightRange < 14 ? 1.1 : 0.7
+  // True 1:1 vertical scale so the rendered pitch matches the real roof geometry.
+  const scaleZ = 1
   const xOffset = (grid.width * grid.pixelSizeMeters) / 2
   const yOffset = (grid.height * grid.pixelSizeMeters) / 2
 
@@ -202,6 +202,7 @@ function analyzeWithSegments(
       const accumulator = accumulators[segmentIndex]
       if (accumulator.cellCount < MIN_PLANE_CELLS) return undefined
       const areaSqFt = (segment.stats?.areaMeters2 ?? 0) / SQ_M_PER_SQ_FT
+      const groundAreaSqFt = (segment.stats?.groundAreaMeters2 ?? 0) / SQ_M_PER_SQ_FT
       const meshX = (accumulator.sumX / accumulator.cellCount) * grid.pixelSizeMeters - mesh.xOffset
       const meshY = (accumulator.sumY / accumulator.cellCount) * grid.pixelSizeMeters - mesh.yOffset
       const meshZ = Math.max(
@@ -212,6 +213,7 @@ function analyzeWithSegments(
         segmentIndex,
         plane: {
           areaSqFt,
+          groundAreaSqFt,
           pitchDegrees: segment.pitchDegrees ?? 0,
           azimuthDegrees: segment.azimuthDegrees ?? 0,
           cellCount: accumulator.cellCount,
@@ -246,6 +248,7 @@ function analyzeWithSegments(
       color: FACET_COLORS[displayIndex % FACET_COLORS.length],
       cellCount: entry.plane.cellCount,
       areaSqFt: entry.plane.areaSqFt,
+      groundAreaSqFt: entry.plane.groundAreaSqFt,
       pitchDegrees: entry.plane.pitchDegrees,
       azimuthDegrees: entry.plane.azimuthDegrees,
       centroid: entry.plane.centroid,
@@ -272,7 +275,10 @@ function analyzeWithSegments(
     cellsByPlane[i] = new Int32Array(cellLists[i])
   }
 
-  // Compute clean polygon per facet using boundary tracing + Douglas-Peucker + azimuth snapping.
+  // Single dominant orientation for the whole building so shared edges align across facets.
+  const globalOrientationRad = computeGlobalOrientation(planes)
+
+  // Compute clean polygon per facet using boundary tracing + Douglas-Peucker + orientation snapping.
   for (let i = 0; i < planes.length; i += 1) {
     const plane = planes[i]
     const cells = cellsByPlane[i]
@@ -284,7 +290,7 @@ function analyzeWithSegments(
       pixelSize,
       xOffset: mesh.xOffset,
       yOffset: mesh.yOffset,
-      azimuthDeg: plane.azimuthDegrees,
+      orientationRad: globalOrientationRad,
       planeEq: plane.planeEquation,
       baseZ: mesh.baseZ,
       scaleZ: mesh.scaleZ,
@@ -299,6 +305,7 @@ function analyzeWithSegments(
   }
 
   const totalAreaSqFt = planes.reduce((sum, plane) => sum + plane.areaSqFt, 0)
+  const totalGroundAreaSqFt = planes.reduce((sum, plane) => sum + plane.groundAreaSqFt, 0)
   const averagePitchDegrees =
     totalAreaSqFt > 0
       ? planes.reduce((sum, plane) => sum + plane.pitchDegrees * plane.areaSqFt, 0) / totalAreaSqFt
@@ -317,6 +324,7 @@ function analyzeWithSegments(
       yOffset: mesh.yOffset,
     },
     totalAreaSqFt: Math.round(totalAreaSqFt),
+    totalGroundAreaSqFt: Math.round(totalGroundAreaSqFt),
     averagePitchDegrees,
     confidence: scoreConfidence({
       validCells,
@@ -327,6 +335,22 @@ function analyzeWithSegments(
       usingSegments: true,
     }),
   }
+}
+
+// Area-weighted dominant orientation, folded to a 90° period (roofs are mostly rectilinear).
+function computeGlobalOrientation(planes: RoofPlane[]): number {
+  let sumSin = 0
+  let sumCos = 0
+  for (const plane of planes) {
+    const weight = Math.max(plane.areaSqFt, 1)
+    // Azimuth is the down-slope compass bearing; the eave/ridge runs perpendicular to it.
+    // Fold to [0, 90) and multiply by 4 so the circular mean respects the 90° symmetry.
+    const foldedRad = (((plane.azimuthDegrees % 90) + 90) % 90) * (Math.PI / 180) * 4
+    sumSin += weight * Math.sin(foldedRad)
+    sumCos += weight * Math.cos(foldedRad)
+  }
+  if (sumSin === 0 && sumCos === 0) return 0
+  return Math.atan2(sumSin, sumCos) / 4
 }
 
 function fillMaskGapsByPropagation(
@@ -426,7 +450,7 @@ type BuildPolygonArgs = {
   pixelSize: number
   xOffset: number
   yOffset: number
-  azimuthDeg: number
+  orientationRad: number
   planeEq: NonNullable<RoofPlane['planeEquation']>
   baseZ: number
   scaleZ: number
@@ -440,7 +464,7 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
     pixelSize,
     xOffset,
     yOffset,
-    azimuthDeg,
+    orientationRad,
     planeEq,
     baseZ,
     scaleZ,
@@ -451,50 +475,24 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
   const cellSet = new Set<number>()
   for (let i = 0; i < cells.length; i += 1) cellSet.add(cells[i])
 
-  const isIn = (x: number, y: number) => {
-    if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight) return false
-    return cellSet.has(y * gridWidth + x)
-  }
+  // Trace the true outer outline along pixel edges (handles concave L/T facets correctly).
+  const cornerLoop = traceCellOutline(cellSet, gridWidth, gridHeight)
+  if (cornerLoop.length < 3) return []
 
-  // Collect boundary cells (4-connectivity) and compute centroid for angle sorting.
-  const boundary: Point2D[] = []
-  let centroidX = 0
-  let centroidY = 0
-  for (let i = 0; i < cells.length; i += 1) {
-    const idx = cells[i]
-    const x = idx % gridWidth
-    const y = Math.floor(idx / gridWidth)
-    centroidX += x
-    centroidY += y
-    const onEdge =
-      !isIn(x - 1, y) || !isIn(x + 1, y) || !isIn(x, y - 1) || !isIn(x, y + 1)
-    if (onEdge) {
-      boundary.push({
-        x: x * pixelSize - xOffset,
-        y: y * pixelSize - yOffset,
-      })
-    }
-  }
-  if (boundary.length < 3) return []
+  // Cell (x,y) center sits at x*pixelSize; its corners are at (x±0.5). Shift corner coords accordingly.
+  const boundary: Point2D[] = cornerLoop.map((corner) => ({
+    x: (corner.x - 0.5) * pixelSize - xOffset,
+    y: (corner.y - 0.5) * pixelSize - yOffset,
+  }))
 
-  const cx = (centroidX / cells.length) * pixelSize - xOffset
-  const cy = (centroidY / cells.length) * pixelSize - yOffset
-
-  // Sort by angle around centroid (works for convex / star-convex shapes, the common case for roof facets).
-  boundary.sort((a, b) => {
-    const angleA = Math.atan2(a.y - cy, a.x - cx)
-    const angleB = Math.atan2(b.y - cy, b.x - cx)
-    return angleA - angleB
-  })
-
-  // Simplify with Douglas-Peucker.
-  const epsilon = pixelSize * 1.6
+  // Simplify the rectilinear staircase into a few straight edges.
+  const epsilon = pixelSize * 1.4
   let simplified = douglasPeuckerClosed(boundary, epsilon)
   if (simplified.length < 3) return []
 
-  // Snap edges to azimuth-aligned directions (parallel to ridge / perpendicular to slope).
-  simplified = snapEdgesToAzimuth(simplified, azimuthDeg)
-  simplified = mergeColinear(simplified, Math.PI / 36, pixelSize * 0.4)
+  // Snap edges to the single building orientation so adjacent facets share aligned ridges/eaves.
+  simplified = snapEdgesToOrientation(simplified, orientationRad)
+  simplified = mergeColinear(simplified, Math.PI / 30, pixelSize * 0.6)
   if (simplified.length < 3) return []
 
   // Project polygon vertices onto the precise 3D plane equation from Solar API.
@@ -508,6 +506,69 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
   })
 
   return result
+}
+
+// Walk the outer pixel-edge contour of a connected cell set, returning ordered corner coordinates.
+function traceCellOutline(
+  cellSet: Set<number>,
+  gridWidth: number,
+  gridHeight: number,
+): Point2D[] {
+  const inSet = (x: number, y: number) => {
+    if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight) return false
+    return cellSet.has(y * gridWidth + x)
+  }
+
+  // Directed boundary edges with the foreground on the right => consistent clockwise winding.
+  // Key a corner by cornerX * STRIDE + cornerY (corner coords range 0..gridWidth/Height).
+  const STRIDE = gridHeight + 2
+  const cornerKey = (x: number, y: number) => x * STRIDE + y
+  const edgesFrom = new Map<number, Point2D[]>()
+  const addEdge = (ax: number, ay: number, bx: number, by: number) => {
+    const k = cornerKey(ax, ay)
+    const list = edgesFrom.get(k)
+    const end = { x: bx, y: by }
+    if (list) list.push(end)
+    else edgesFrom.set(k, [end])
+  }
+
+  for (const idx of cellSet) {
+    const x = idx % gridWidth
+    const y = Math.floor(idx / gridWidth)
+    if (!inSet(x, y - 1)) addEdge(x, y, x + 1, y)
+    if (!inSet(x + 1, y)) addEdge(x + 1, y, x + 1, y + 1)
+    if (!inSet(x, y + 1)) addEdge(x + 1, y + 1, x, y + 1)
+    if (!inSet(x - 1, y)) addEdge(x, y + 1, x, y)
+  }
+
+  if (edgesFrom.size === 0) return []
+
+  // Find the lexicographically smallest corner that starts an edge as the loop seed.
+  let startKey = Number.POSITIVE_INFINITY
+  let startCorner: Point2D | undefined
+  for (const [k, ends] of edgesFrom) {
+    if (ends.length === 0) continue
+    if (k < startKey) {
+      startKey = k
+      startCorner = { x: Math.floor(k / STRIDE), y: k % STRIDE }
+    }
+  }
+  if (!startCorner) return []
+
+  const loop: Point2D[] = []
+  let current = startCorner
+  const maxSteps = edgesFrom.size * 4 + 8
+  for (let step = 0; step < maxSteps; step += 1) {
+    const k = cornerKey(current.x, current.y)
+    const ends = edgesFrom.get(k)
+    if (!ends || ends.length === 0) break
+    const next = ends.shift()!
+    loop.push(current)
+    if (next.x === startCorner.x && next.y === startCorner.y) break
+    current = next
+  }
+
+  return loop.length >= 3 ? loop : []
 }
 
 function douglasPeuckerClosed(points: Point2D[], epsilon: number): Point2D[] {
@@ -571,16 +632,15 @@ function perpDistance(p: Point2D, a: Point2D, b: Point2D): number {
   return num / Math.sqrt(len2)
 }
 
-function snapEdgesToAzimuth(polygon: Point2D[], azimuthDeg: number): Point2D[] {
+function snapEdgesToOrientation(polygon: Point2D[], orientationRad: number): Point2D[] {
   if (polygon.length < 3) return polygon
-  const azRad = (azimuthDeg * Math.PI) / 180
-  // +y points south, +x east. Azimuth 0° = north => slope direction is (0, -1).
-  // Slope direction (down-slope): (sin(az), -cos(az))
-  const slope = { x: Math.sin(azRad), y: -Math.cos(azRad) }
-  // Perpendicular to slope (along ridge / eave): (-slope.y, slope.x) = (cos(az), sin(az))
-  const perp = { x: Math.cos(azRad), y: Math.sin(azRad) }
+  // Two orthogonal building axes shared by every facet on the roof.
+  const axisA = { x: Math.cos(orientationRad), y: Math.sin(orientationRad) }
+  const axisB = { x: -Math.sin(orientationRad), y: Math.cos(orientationRad) }
+  const slope = axisA
+  const perp = axisB
 
-  const SNAP_TOL_DEG = 18
+  const SNAP_TOL_DEG = 22
   const snapCos = Math.cos((SNAP_TOL_DEG * Math.PI) / 180)
 
   // Iterative snap (multiple passes converge as endpoints get shared).
@@ -671,6 +731,7 @@ function analyzeWithFallbackClustering(
       yOffset: mesh.yOffset,
     },
     totalAreaSqFt: 0,
+    totalGroundAreaSqFt: 0,
     averagePitchDegrees: 0,
     confidence: scoreConfidence({
       validCells: 0,

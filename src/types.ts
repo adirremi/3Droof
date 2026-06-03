@@ -103,6 +103,7 @@ export type RoofPlane = {
   color: string
   cellCount: number
   areaSqFt: number
+  groundAreaSqFt: number
   pitchDegrees: number
   azimuthDegrees: number
   centroid: Point3D
@@ -132,6 +133,7 @@ export type RoofAnalysisResult = {
     yOffset: number
   }
   totalAreaSqFt: number
+  totalGroundAreaSqFt: number
   averagePitchDegrees: number
   confidence: ConfidenceResult
 }

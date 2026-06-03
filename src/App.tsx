@@ -278,8 +278,20 @@ function App() {
           {analysis ? (
             <>
               <div className="metric-list">
-                <Metric label="Total roof area" value={`${analysis.totalAreaSqFt.toLocaleString()} sq ft`} />
-                <Metric label="Average pitch" value={`${analysis.averagePitchDegrees.toFixed(1)} deg`} />
+                <Metric
+                  label="Roof surface area"
+                  hint="Tilted area — use for shingles/material"
+                  value={`${analysis.totalAreaSqFt.toLocaleString()} sq ft`}
+                />
+                <Metric
+                  label="Footprint area"
+                  hint="Ground projection (plan view)"
+                  value={`${analysis.totalGroundAreaSqFt.toLocaleString()} sq ft`}
+                />
+                <Metric
+                  label="Average pitch"
+                  value={`${analysis.averagePitchDegrees.toFixed(1)}° · ${pitchToRatio(analysis.averagePitchDegrees)}`}
+                />
                 <Metric label="Detected facets" value={analysis.planes.length.toString()} />
                 <Metric label="Confidence" value={`${analysis.confidence.score}%`} />
               </div>
@@ -410,13 +422,22 @@ function App() {
   )
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="metric">
-      <span>{label}</span>
+      <span className="metric-label">
+        {label}
+        {hint && <small>{hint}</small>}
+      </span>
       <strong>{value}</strong>
     </div>
   )
+}
+
+function pitchToRatio(pitchDegrees: number): string {
+  if (pitchDegrees <= 0.5) return 'flat'
+  const rise = Math.round(12 * Math.tan((pitchDegrees * Math.PI) / 180))
+  return `${rise}:12`
 }
 
 function RoofGeometry({ analysis }: { analysis: RoofAnalysisResult }) {
@@ -485,7 +506,6 @@ function PlaneMesh({
 }
 
 function FacetDetailsCard({ plane, onClose }: { plane: RoofPlane; onClose: () => void }) {
-  const sqMeters = (plane.areaSqFt * 0.092903).toFixed(1)
   return (
     <div className="facet-card">
       <button className="facet-card-close" type="button" onClick={onClose} aria-label="Close">
@@ -497,29 +517,39 @@ function FacetDetailsCard({ plane, onClose }: { plane: RoofPlane; onClose: () =>
         </span>
         <div>
           <strong>{plane.label}</strong>
-          <p>Solar API segment</p>
+          <p>{compassLabel(plane.azimuthDegrees)} facing</p>
         </div>
       </div>
       <div className="facet-card-grid">
         <div>
           <span>Pitch</span>
           <strong>{plane.pitchDegrees.toFixed(1)}°</strong>
+          <small>{pitchToRatio(plane.pitchDegrees)}</small>
         </div>
         <div>
           <span>Azimuth</span>
           <strong>{plane.azimuthDegrees.toFixed(0)}°</strong>
+          <small>{compassLabel(plane.azimuthDegrees)}</small>
         </div>
         <div>
-          <span>Area</span>
-          <strong>{Math.round(plane.areaSqFt).toLocaleString()} sq ft</strong>
+          <span>Surface</span>
+          <strong>{Math.round(plane.areaSqFt).toLocaleString()}</strong>
+          <small>sq ft (tilted)</small>
         </div>
         <div>
-          <span>Area (m²)</span>
-          <strong>{sqMeters}</strong>
+          <span>Footprint</span>
+          <strong>{Math.round(plane.groundAreaSqFt).toLocaleString()}</strong>
+          <small>sq ft (plan)</small>
         </div>
       </div>
     </div>
   )
+}
+
+function compassLabel(azimuthDegrees: number): string {
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+  const index = Math.round((((azimuthDegrees % 360) + 360) % 360) / 45) % 8
+  return dirs[index]
 }
 
 function CheckItem({ ok, text }: { ok: boolean; text: string }) {
