@@ -22,6 +22,10 @@ export function getGoogleConfiguration() {
   }
 }
 
+export function getGoogleApiKey() {
+  return normalizeKey(GOOGLE_KEY)
+}
+
 export function getReferrerHints() {
   if (typeof window === 'undefined') {
     return [

@@ -2,7 +2,9 @@ import { Canvas } from '@react-three/fiber'
 import { Billboard, OrbitControls, Text } from '@react-three/drei'
 import {
   AlertTriangle,
+  Box,
   CheckCircle2,
+  Image as ImageIcon,
   Loader2,
   MapPin,
   Search,
@@ -11,6 +13,7 @@ import {
 import { useMemo, useState } from 'react'
 import { BufferGeometry, DoubleSide, Float32BufferAttribute } from 'three'
 import './App.css'
+import { Photorealistic3DView } from './components/Photorealistic3DView'
 import { getCostScenario } from './lib/costModel'
 import {
   analyzeDsmRoof,
@@ -19,6 +22,7 @@ import {
 } from './lib/roofAnalysis'
 import {
   fetchSolarPackage,
+  getGoogleApiKey,
   getGoogleConfiguration,
   searchPlaces,
 } from './services/googleSolar'
@@ -38,7 +42,10 @@ function App() {
   const [solarPackage, setSolarPackage] = useState<SolarPackage>()
   const [analysis, setAnalysis] = useState<RoofAnalysisResult>()
   const [selectedFacetId, setSelectedFacetId] = useState<string | undefined>()
+  const [viewMode, setViewMode] = useState<'photo' | 'diagram'>('photo')
   const [loading, setLoading] = useState(false)
+  const apiKey = getGoogleApiKey()
+  const location = solarPackage?.place.location
   const [searching, setSearching] = useState(false)
   const [message, setMessage] = useState<string>()
   const [monthlyProperties, setMonthlyProperties] = useState(100)
@@ -196,12 +203,36 @@ function App() {
 
       <section className="dashboard-grid">
         <article className="viewer-card">
-          <div className="card-title">
-            <h2>3D roof mesh</h2>
-            <p>{selectedAddress ?? 'Pick a Florida address above to render the roof.'}</p>
+          <div className="card-title viewer-title">
+            <div>
+              <h2>3D roof</h2>
+              <p>{selectedAddress ?? 'Pick a Florida address above to render the roof.'}</p>
+            </div>
+            {location && apiKey && (
+              <div className="view-toggle" role="tablist">
+                <button
+                  type="button"
+                  className={viewMode === 'photo' ? 'active' : ''}
+                  onClick={() => setViewMode('photo')}
+                >
+                  <ImageIcon size={15} />
+                  Photo 3D
+                </button>
+                <button
+                  type="button"
+                  className={viewMode === 'diagram' ? 'active' : ''}
+                  onClick={() => setViewMode('diagram')}
+                >
+                  <Box size={15} />
+                  Diagram
+                </button>
+              </div>
+            )}
           </div>
           <div className="viewer">
-            {analysis ? (
+            {location && apiKey && viewMode === 'photo' ? (
+              <Photorealistic3DView location={location} apiKey={apiKey} />
+            ) : analysis ? (
               <>
                 <Canvas
                   camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}
