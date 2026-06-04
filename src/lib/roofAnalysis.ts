@@ -292,7 +292,11 @@ function analyzeWithSegments(
       yOffset: mesh.yOffset,
       orientationRad: globalOrientationRad,
       planeEq: plane.planeEquation,
-      baseZ: mesh.baseZ,
+      // Anchor the facet to its real measured DSM height, then tilt it with the precise
+      // Solar pitch/azimuth gradient. This avoids datum mismatches that flattened the model.
+      anchorZ: plane.centroid.z,
+      centerX: plane.centroid.x,
+      centerY: plane.centroid.y,
       scaleZ: mesh.scaleZ,
     })
     if (polygon3D.length >= 3) {
@@ -452,7 +456,9 @@ type BuildPolygonArgs = {
   yOffset: number
   orientationRad: number
   planeEq: NonNullable<RoofPlane['planeEquation']>
-  baseZ: number
+  anchorZ: number
+  centerX: number
+  centerY: number
   scaleZ: number
 }
 
@@ -466,7 +472,9 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
     yOffset,
     orientationRad,
     planeEq,
-    baseZ,
+    anchorZ,
+    centerX,
+    centerY,
     scaleZ,
   } = args
 
@@ -495,14 +503,14 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
   simplified = mergeColinear(simplified, Math.PI / 30, pixelSize * 0.6)
   if (simplified.length < 3) return []
 
-  // Project polygon vertices onto the precise 3D plane equation from Solar API.
+  // Slope gradient (rise per horizontal metre) straight from the Solar pitch/azimuth normal.
+  const gradX = -planeEq.nx / (planeEq.nz || 1)
+  const gradY = -planeEq.ny / (planeEq.nz || 1)
+
+  // Tilt the facet around its measured anchor height using the exact Solar gradient.
   const result: Point3D[] = simplified.map((p) => {
-    const worldZ =
-      planeEq.cz -
-      (planeEq.nx * (p.x - planeEq.cxMeters) + planeEq.ny * (p.y - planeEq.cyMeters)) /
-        (planeEq.nz || 1)
-    const meshZ = Math.max(0, worldZ - baseZ) * scaleZ
-    return { x: p.x, y: p.y, z: meshZ }
+    const rise = (gradX * (p.x - centerX) + gradY * (p.y - centerY)) * scaleZ
+    return { x: p.x, y: p.y, z: Math.max(0, anchorZ + rise) }
   })
 
   return result

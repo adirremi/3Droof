@@ -31,7 +31,7 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
   return (
     <>
       <Canvas
-        camera={{ position: [90, 70, 90], fov: 55, near: 1, far: 1_000_000 }}
+        camera={{ position: [24, 22, 24], fov: 45, near: 1, far: 1_000_000 }}
         gl={{ logarithmicDepthBuffer: true, antialias: true }}
       >
         <ambientLight intensity={1.2} />
@@ -58,8 +58,9 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
           enablePan
           enableZoom
           enableRotate
-          minDistance={25}
-          maxDistance={4000}
+          minDistance={12}
+          maxDistance={250}
+          maxPolarAngle={Math.PI / 2.05}
         />
       </Canvas>
       {error && (
