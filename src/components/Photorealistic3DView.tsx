@@ -31,7 +31,7 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
   return (
     <>
       <Canvas
-        camera={{ position: [22, 18, 22], fov: 42, near: 1, far: 1_000_000 }}
+        camera={{ position: [70, 55, 70], fov: 50, near: 1, far: 1_000_000 }}
         gl={{ logarithmicDepthBuffer: true, antialias: true }}
       >
         <ambientLight intensity={1.2} />
@@ -84,9 +84,11 @@ function GroundSettler({ resetKey }: { resetKey: string }) {
   const { scene, camera, controls } = useThree()
   const raycaster = useRef(new Raycaster())
   const settled = useRef(false)
+  const attempts = useRef(0)
 
   useEffect(() => {
     settled.current = false
+    attempts.current = 0
   }, [resetKey])
 
   useFrame(() => {
@@ -95,6 +97,13 @@ function GroundSettler({ resetKey }: { resetKey: string }) {
     const orbit = controls as any
     if (!orbit?.target) return
 
+    attempts.current += 1
+    // Stop hammering the raycaster if coverage never loads (keeps the wide framing).
+    if (attempts.current > 1200) {
+      settled.current = true
+      return
+    }
+
     raycaster.current.set(new Vector3(0, 8000, 0), new Vector3(0, -1, 0))
     raycaster.current.far = 40000
     const hits = raycaster.current.intersectObject(scene, true)
@@ -102,10 +111,13 @@ function GroundSettler({ resetKey }: { resetKey: string }) {
     const hit = hits.find((entry) => (entry.object as any).isMesh)
     if (!hit) return
 
+    // Recenter the orbit on the real roof height and pull in for a tight, building-filling view.
     const groundY = hit.point.y
-    const offset = new Vector3().subVectors(camera.position, orbit.target)
+    const dir = new Vector3().subVectors(camera.position, orbit.target)
+    if (dir.lengthSq() < 1e-6) dir.set(1, 0.85, 1)
+    dir.normalize()
     orbit.target.set(0, groundY, 0)
-    camera.position.copy(orbit.target).add(offset)
+    camera.position.copy(orbit.target).addScaledVector(dir, 46)
     orbit.update?.()
     settled.current = true
   })
