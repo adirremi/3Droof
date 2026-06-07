@@ -275,10 +275,7 @@ function analyzeWithSegments(
     cellsByPlane[i] = new Int32Array(cellLists[i])
   }
 
-  // Single dominant orientation for the whole building so shared edges align across facets.
-  const globalOrientationRad = computeGlobalOrientation(planes)
-
-  // Compute clean polygon per facet using boundary tracing + Douglas-Peucker + orientation snapping.
+  // Compute clean polygon per facet using boundary tracing + Douglas-Peucker.
   for (let i = 0; i < planes.length; i += 1) {
     const plane = planes[i]
     const cells = cellsByPlane[i]
@@ -290,7 +287,6 @@ function analyzeWithSegments(
       pixelSize,
       xOffset: mesh.xOffset,
       yOffset: mesh.yOffset,
-      orientationRad: globalOrientationRad,
       planeEq: plane.planeEquation,
       // Anchor the facet to its real measured DSM height, then tilt it with the precise
       // Solar pitch/azimuth gradient. This avoids datum mismatches that flattened the model.
@@ -339,22 +335,6 @@ function analyzeWithSegments(
       usingSegments: true,
     }),
   }
-}
-
-// Area-weighted dominant orientation, folded to a 90° period (roofs are mostly rectilinear).
-function computeGlobalOrientation(planes: RoofPlane[]): number {
-  let sumSin = 0
-  let sumCos = 0
-  for (const plane of planes) {
-    const weight = Math.max(plane.areaSqFt, 1)
-    // Azimuth is the down-slope compass bearing; the eave/ridge runs perpendicular to it.
-    // Fold to [0, 90) and multiply by 4 so the circular mean respects the 90° symmetry.
-    const foldedRad = (((plane.azimuthDegrees % 90) + 90) % 90) * (Math.PI / 180) * 4
-    sumSin += weight * Math.sin(foldedRad)
-    sumCos += weight * Math.cos(foldedRad)
-  }
-  if (sumSin === 0 && sumCos === 0) return 0
-  return Math.atan2(sumSin, sumCos) / 4
 }
 
 function fillMaskGapsByPropagation(
@@ -454,7 +434,6 @@ type BuildPolygonArgs = {
   pixelSize: number
   xOffset: number
   yOffset: number
-  orientationRad: number
   planeEq: NonNullable<RoofPlane['planeEquation']>
   anchorZ: number
   centerX: number
@@ -470,7 +449,6 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
     pixelSize,
     xOffset,
     yOffset,
-    orientationRad,
     planeEq,
     anchorZ,
     centerX,
@@ -480,8 +458,10 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
 
   if (cells.length < 4) return []
 
+  // Keep only the largest connected blob so stray propagated pixels don't distort the outline.
+  const mainCells = largestConnectedComponent(cells, gridWidth, gridHeight)
   const cellSet = new Set<number>()
-  for (let i = 0; i < cells.length; i += 1) cellSet.add(cells[i])
+  for (let i = 0; i < mainCells.length; i += 1) cellSet.add(mainCells[i])
 
   // Trace the true outer outline along pixel edges (handles concave L/T facets correctly).
   const cornerLoop = traceCellOutline(cellSet, gridWidth, gridHeight)
@@ -493,14 +473,11 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
     y: (corner.y - 0.5) * pixelSize - yOffset,
   }))
 
-  // Simplify the rectilinear staircase into a few straight edges.
-  const epsilon = pixelSize * 1.4
+  // Simplify the rectilinear staircase into a few straight edges (no forced orthogonal snapping,
+  // so hips and diagonal eaves keep their real angles).
+  const epsilon = pixelSize * 1.8
   let simplified = douglasPeuckerClosed(boundary, epsilon)
-  if (simplified.length < 3) return []
-
-  // Snap edges to the single building orientation so adjacent facets share aligned ridges/eaves.
-  simplified = snapEdgesToOrientation(simplified, orientationRad)
-  simplified = mergeColinear(simplified, Math.PI / 30, pixelSize * 0.6)
+  simplified = mergeColinear(simplified, Math.PI / 24, pixelSize * 0.8)
   if (simplified.length < 3) return []
 
   // Slope gradient (rise per horizontal metre) straight from the Solar pitch/azimuth normal.
@@ -516,7 +493,50 @@ function buildFacetPolygon3D(args: BuildPolygonArgs): Point3D[] {
   return result
 }
 
-// Walk the outer pixel-edge contour of a connected cell set, returning ordered corner coordinates.
+// Keep only the largest 4-connected blob of cells so isolated propagated pixels are dropped.
+function largestConnectedComponent(
+  cells: Int32Array,
+  gridWidth: number,
+  gridHeight: number,
+): Int32Array {
+  if (cells.length === 0) return cells
+  const present = new Set<number>()
+  for (let i = 0; i < cells.length; i += 1) present.add(cells[i])
+
+  const visited = new Set<number>()
+  let best: number[] = []
+
+  for (let i = 0; i < cells.length; i += 1) {
+    const seed = cells[i]
+    if (visited.has(seed)) continue
+    const stack = [seed]
+    visited.add(seed)
+    const component: number[] = []
+    while (stack.length > 0) {
+      const idx = stack.pop()!
+      component.push(idx)
+      const x = idx % gridWidth
+      const y = Math.floor(idx / gridWidth)
+      const neighbors = [
+        x > 0 ? idx - 1 : -1,
+        x < gridWidth - 1 ? idx + 1 : -1,
+        y > 0 ? idx - gridWidth : -1,
+        y < gridHeight - 1 ? idx + gridWidth : -1,
+      ]
+      for (const n of neighbors) {
+        if (n >= 0 && present.has(n) && !visited.has(n)) {
+          visited.add(n)
+          stack.push(n)
+        }
+      }
+    }
+    if (component.length > best.length) best = component
+  }
+
+  return new Int32Array(best)
+}
+
+// Walk the outer pixel-edge contour, returning the longest closed loop of corner coordinates.
 function traceCellOutline(
   cellSet: Set<number>,
   gridWidth: number,
@@ -528,7 +548,6 @@ function traceCellOutline(
   }
 
   // Directed boundary edges with the foreground on the right => consistent clockwise winding.
-  // Key a corner by cornerX * STRIDE + cornerY (corner coords range 0..gridWidth/Height).
   const STRIDE = gridHeight + 2
   const cornerKey = (x: number, y: number) => x * STRIDE + y
   const edgesFrom = new Map<number, Point2D[]>()
@@ -551,32 +570,29 @@ function traceCellOutline(
 
   if (edgesFrom.size === 0) return []
 
-  // Find the lexicographically smallest corner that starts an edge as the loop seed.
-  let startKey = Number.POSITIVE_INFINITY
-  let startCorner: Point2D | undefined
-  for (const [k, ends] of edgesFrom) {
-    if (ends.length === 0) continue
-    if (k < startKey) {
-      startKey = k
-      startCorner = { x: Math.floor(k / STRIDE), y: k % STRIDE }
+  // Walk every available edge into closed loops; keep the longest (the outer building outline).
+  let longest: Point2D[] = []
+  for (const [seedKey, seedEnds] of edgesFrom) {
+    while (seedEnds.length > 0) {
+      const startX = Math.floor(seedKey / STRIDE)
+      const startY = seedKey % STRIDE
+      const loop: Point2D[] = []
+      let current = { x: startX, y: startY }
+      const maxSteps = edgesFrom.size * 4 + 8
+      for (let step = 0; step < maxSteps; step += 1) {
+        const k = cornerKey(current.x, current.y)
+        const ends = edgesFrom.get(k)
+        if (!ends || ends.length === 0) break
+        const next = ends.shift()!
+        loop.push(current)
+        if (next.x === startX && next.y === startY) break
+        current = next
+      }
+      if (loop.length > longest.length) longest = loop
     }
   }
-  if (!startCorner) return []
 
-  const loop: Point2D[] = []
-  let current = startCorner
-  const maxSteps = edgesFrom.size * 4 + 8
-  for (let step = 0; step < maxSteps; step += 1) {
-    const k = cornerKey(current.x, current.y)
-    const ends = edgesFrom.get(k)
-    if (!ends || ends.length === 0) break
-    const next = ends.shift()!
-    loop.push(current)
-    if (next.x === startCorner.x && next.y === startCorner.y) break
-    current = next
-  }
-
-  return loop.length >= 3 ? loop : []
+  return longest.length >= 3 ? longest : []
 }
 
 function douglasPeuckerClosed(points: Point2D[], epsilon: number): Point2D[] {
@@ -638,51 +654,6 @@ function perpDistance(p: Point2D, a: Point2D, b: Point2D): number {
   }
   const num = Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x)
   return num / Math.sqrt(len2)
-}
-
-function snapEdgesToOrientation(polygon: Point2D[], orientationRad: number): Point2D[] {
-  if (polygon.length < 3) return polygon
-  // Two orthogonal building axes shared by every facet on the roof.
-  const axisA = { x: Math.cos(orientationRad), y: Math.sin(orientationRad) }
-  const axisB = { x: -Math.sin(orientationRad), y: Math.cos(orientationRad) }
-  const slope = axisA
-  const perp = axisB
-
-  const SNAP_TOL_DEG = 22
-  const snapCos = Math.cos((SNAP_TOL_DEG * Math.PI) / 180)
-
-  // Iterative snap (multiple passes converge as endpoints get shared).
-  const result: Point2D[] = polygon.map((p) => ({ x: p.x, y: p.y }))
-  for (let pass = 0; pass < 3; pass += 1) {
-    for (let i = 0; i < result.length; i += 1) {
-      const a = result[i]
-      const b = result[(i + 1) % result.length]
-      const ex = b.x - a.x
-      const ey = b.y - a.y
-      const elen = Math.sqrt(ex * ex + ey * ey)
-      if (elen < 1e-3) continue
-      const ux = ex / elen
-      const uy = ey / elen
-
-      const dotSlope = Math.abs(ux * slope.x + uy * slope.y)
-      const dotPerp = Math.abs(ux * perp.x + uy * perp.y)
-      let target: Point2D | undefined
-      if (dotPerp > snapCos && dotPerp >= dotSlope) target = perp
-      else if (dotSlope > snapCos) target = slope
-      if (!target) continue
-
-      const sign = ux * target.x + uy * target.y >= 0 ? 1 : -1
-      const midX = (a.x + b.x) / 2
-      const midY = (a.y + b.y) / 2
-      const half = elen / 2
-      result[i] = { x: midX - sign * half * target.x, y: midY - sign * half * target.y }
-      result[(i + 1) % result.length] = {
-        x: midX + sign * half * target.x,
-        y: midY + sign * half * target.y,
-      }
-    }
-  }
-  return result
 }
 
 function mergeColinear(polygon: Point2D[], angleTolRad: number, minEdgeMeters: number): Point2D[] {

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Canvas } from '@react-three/fiber'
+import { useEffect, useRef, useState } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import {
   TilesAttributionOverlay,
@@ -7,7 +7,7 @@ import {
   TilesRenderer,
 } from '3d-tiles-renderer/r3f'
 import { GoogleCloudAuthPlugin, ReorientationPlugin } from '3d-tiles-renderer/plugins'
-import { MathUtils } from 'three'
+import { MathUtils, Raycaster, Vector3 } from 'three'
 import type { LatLng } from '../types'
 
 type Props = {
@@ -31,7 +31,7 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
   return (
     <>
       <Canvas
-        camera={{ position: [24, 22, 24], fov: 45, near: 1, far: 1_000_000 }}
+        camera={{ position: [22, 18, 22], fov: 42, near: 1, far: 1_000_000 }}
         gl={{ logarithmicDepthBuffer: true, antialias: true }}
       >
         <ambientLight intensity={1.2} />
@@ -52,14 +52,14 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
           />
           <TilesAttributionOverlay />
         </TilesRenderer>
+        <GroundSettler resetKey={remountKey} />
         <OrbitControls
           makeDefault
-          target={[0, 0, 0]}
           enablePan
           enableZoom
           enableRotate
           minDistance={12}
-          maxDistance={250}
+          maxDistance={180}
           maxPolarAngle={Math.PI / 2.05}
         />
       </Canvas>
@@ -75,4 +75,40 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
       )}
     </>
   )
+}
+
+// The reoriented globe puts the ellipsoid surface at the origin, but the real ground sits below
+// it by the local geoid offset (~30m in Florida). This raycasts down onto the loaded tiles to
+// find the actual roof/ground height and recenters the orbit so the building fills the frame.
+function GroundSettler({ resetKey }: { resetKey: string }) {
+  const { scene, camera, controls } = useThree()
+  const raycaster = useRef(new Raycaster())
+  const settled = useRef(false)
+
+  useEffect(() => {
+    settled.current = false
+  }, [resetKey])
+
+  useFrame(() => {
+    if (settled.current) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orbit = controls as any
+    if (!orbit?.target) return
+
+    raycaster.current.set(new Vector3(0, 8000, 0), new Vector3(0, -1, 0))
+    raycaster.current.far = 40000
+    const hits = raycaster.current.intersectObject(scene, true)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hit = hits.find((entry) => (entry.object as any).isMesh)
+    if (!hit) return
+
+    const groundY = hit.point.y
+    const offset = new Vector3().subVectors(camera.position, orbit.target)
+    orbit.target.set(0, groundY, 0)
+    camera.position.copy(orbit.target).add(offset)
+    orbit.update?.()
+    settled.current = true
+  })
+
+  return null
 }
