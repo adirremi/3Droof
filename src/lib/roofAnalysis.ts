@@ -1,3 +1,4 @@
+import { ShapeUtils, Vector2 } from 'three'
 import type {
   GridData,
   LatLng,
@@ -297,10 +298,20 @@ function analyzeWithSegments(
     })
     if (polygon3D.length >= 3) {
       plane.polygon3D = polygon3D
-      const cz = polygon3D.reduce((sum, p) => sum + p.z, 0) / polygon3D.length
-      const cxMesh = polygon3D.reduce((sum, p) => sum + p.x, 0) / polygon3D.length
-      const cyMesh = polygon3D.reduce((sum, p) => sum + p.y, 0) / polygon3D.length
-      plane.centroid = { x: cxMesh, y: cyMesh, z: cz }
+    }
+  }
+
+  // Weld nearby vertices across facets so ridges/valleys meet exactly instead of leaving steps.
+  weldFacetPolygons(planes)
+
+  // Recompute label anchors from the final welded polygons.
+  for (const plane of planes) {
+    const polygon = plane.polygon3D
+    if (!polygon || polygon.length < 3) continue
+    plane.centroid = {
+      x: polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length,
+      y: polygon.reduce((sum, p) => sum + p.y, 0) / polygon.length,
+      z: polygon.reduce((sum, p) => sum + p.z, 0) / polygon.length,
     }
   }
 
@@ -782,33 +793,121 @@ export function createPlaneMeshGeometry(plane: RoofPlane): {
   const polygon = plane.polygon3D
   if (!polygon || polygon.length < 3) return null
 
-  // Fan-triangulate around the polygon's centroid for robust rendering of slightly concave shapes.
-  let cx = 0
-  let cy = 0
-  let cz = 0
-  for (const point of polygon) {
-    cx += point.x
-    cy += point.y
-    cz += point.z
-  }
-  cx /= polygon.length
-  cy /= polygon.length
-  cz /= polygon.length
-
-  const vertices: number[] = [cx, cy, cz]
+  const vertices: number[] = []
   for (const point of polygon) {
     vertices.push(point.x, point.y, point.z)
   }
 
-  const indices: number[] = []
-  for (let i = 0; i < polygon.length; i += 1) {
-    const a = 0
-    const b = 1 + i
-    const c = 1 + ((i + 1) % polygon.length)
-    indices.push(a, b, c)
+  // Proper ear-clipping triangulation: correct for concave (L/T) facets, where a centroid
+  // fan would spill triangles outside the polygon.
+  try {
+    const contour = polygon.map((p) => new Vector2(p.x, p.y))
+    const triangles = ShapeUtils.triangulateShape(contour, [])
+    if (triangles.length > 0) {
+      const indices: number[] = []
+      for (const tri of triangles) {
+        indices.push(tri[0], tri[1], tri[2])
+      }
+      return { vertices, indices }
+    }
+  } catch {
+    // Degenerate/self-intersecting outline: fall through to the fan fallback below.
   }
 
-  return { vertices, indices }
+  const cx = polygon.reduce((sum, p) => sum + p.x, 0) / polygon.length
+  const cy = polygon.reduce((sum, p) => sum + p.y, 0) / polygon.length
+  const cz = polygon.reduce((sum, p) => sum + p.z, 0) / polygon.length
+  const fanVertices: number[] = [cx, cy, cz, ...vertices]
+  const fanIndices: number[] = []
+  for (let i = 0; i < polygon.length; i += 1) {
+    fanIndices.push(0, 1 + i, 1 + ((i + 1) % polygon.length))
+  }
+  return { vertices: fanVertices, indices: fanIndices }
+}
+
+// Cluster vertices from different facets that sit within weld range and replace each cluster
+// with its average position, closing the small steps/gaps along shared ridges and valleys.
+function weldFacetPolygons(planes: RoofPlane[]) {
+  const WELD_XY = 0.85
+  const WELD_Z = 1.4
+  type Entry = { planeIdx: number; vertIdx: number; p: Point3D }
+  const entries: Entry[] = []
+  planes.forEach((plane, planeIdx) => {
+    plane.polygon3D?.forEach((p, vertIdx) => {
+      entries.push({ planeIdx, vertIdx, p })
+    })
+  })
+  if (entries.length === 0) return
+
+  const parent = entries.map((_, i) => i)
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]]
+      i = parent[i]
+    }
+    return i
+  }
+  const union = (a: number, b: number) => {
+    const ra = find(a)
+    const rb = find(b)
+    if (ra !== rb) parent[rb] = ra
+  }
+
+  // Spatial hash on XY for near-linear pairing.
+  const cellSize = WELD_XY
+  const hash = new Map<string, number[]>()
+  entries.forEach((entry, i) => {
+    const gx = Math.floor(entry.p.x / cellSize)
+    const gy = Math.floor(entry.p.y / cellSize)
+    for (let dx = -1; dx <= 1; dx += 1) {
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const key = `${gx + dx},${gy + dy}`
+        const bucket = hash.get(key)
+        if (bucket) {
+          for (const j of bucket) {
+            const other = entries[j]
+            if (other.planeIdx === entry.planeIdx) continue
+            const ddx = other.p.x - entry.p.x
+            const ddy = other.p.y - entry.p.y
+            if (
+              ddx * ddx + ddy * ddy <= WELD_XY * WELD_XY &&
+              Math.abs(other.p.z - entry.p.z) <= WELD_Z
+            ) {
+              union(i, j)
+            }
+          }
+        }
+      }
+    }
+    const selfKey = `${gx},${gy}`
+    const selfBucket = hash.get(selfKey)
+    if (selfBucket) selfBucket.push(i)
+    else hash.set(selfKey, [i])
+  })
+
+  // Average each cluster and write back.
+  const clusters = new Map<number, Entry[]>()
+  entries.forEach((entry, i) => {
+    const root = find(i)
+    const list = clusters.get(root)
+    if (list) list.push(entry)
+    else clusters.set(root, [entry])
+  })
+
+  for (const members of clusters.values()) {
+    if (members.length < 2) continue
+    const avg = members.reduce(
+      (acc, m) => ({ x: acc.x + m.p.x, y: acc.y + m.p.y, z: acc.z + m.p.z }),
+      { x: 0, y: 0, z: 0 },
+    )
+    avg.x /= members.length
+    avg.y /= members.length
+    avg.z /= members.length
+    for (const member of members) {
+      const polygon = planes[member.planeIdx].polygon3D!
+      polygon[member.vertIdx] = { x: avg.x, y: avg.y, z: avg.z }
+    }
+  }
 }
 
 type MeshRenderSettings = {

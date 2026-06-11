@@ -10,6 +10,8 @@ import {
   GLTFExtensionsPlugin,
   GoogleCloudAuthPlugin,
   ReorientationPlugin,
+  TilesFadePlugin,
+  UnloadTilesPlugin,
 } from '3d-tiles-renderer/plugins'
 import { MathUtils, Raycaster, Vector3, type WebGLRenderer } from 'three'
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
@@ -19,6 +21,7 @@ import type { LatLng } from '../types'
 type Props = {
   location: LatLng
   apiKey: string
+  buildingRadius?: number
 }
 
 const DRACO_DECODER_PATH = 'https://www.gstatic.com/draco/versioned/decoders/1.5.7/'
@@ -26,12 +29,15 @@ const KTX2_TRANSCODER_PATH = 'https://cdn.jsdelivr.net/npm/three@0.184.0/example
 
 // Renders Google's Photorealistic 3D Tiles (the same textured mesh used by Google Maps 3D),
 // re-centered on the target building so the user can orbit around it like a real 3D photo.
-export function Photorealistic3DView({ location, apiKey }: Props) {
+export function Photorealistic3DView({ location, apiKey, buildingRadius }: Props) {
   const [error, setError] = useState<string>()
 
   const lat = location.lat * MathUtils.DEG2RAD
   const lon = location.lng * MathUtils.DEG2RAD
   const remountKey = `${location.lat.toFixed(6)},${location.lng.toFixed(6)}`
+
+  // Final orbit distance scales with the actual building footprint.
+  const settleDistance = Math.min(Math.max((buildingRadius ?? 18) * 2.3, 30), 110)
 
   useEffect(() => {
     setError(undefined)
@@ -52,14 +58,14 @@ export function Photorealistic3DView({ location, apiKey }: Props) {
           remountKey={remountKey}
           onError={setError}
         />
-        <GroundSettler resetKey={remountKey} />
+        <GroundSettler resetKey={remountKey} settleDistance={settleDistance} />
         <OrbitControls
           makeDefault
           enablePan
           enableZoom
           enableRotate
           minDistance={12}
-          maxDistance={180}
+          maxDistance={220}
           maxPolarAngle={Math.PI / 2.05}
         />
       </Canvas>
@@ -102,6 +108,8 @@ function TilesScene({ apiKey, lat, lon, remountKey, onError }: TilesSceneProps) 
   return (
     <TilesRenderer
       key={remountKey}
+      // Lower error target = sharper, higher-detail tiles near the building.
+      errorTarget={6}
       onLoadError={((event: { error?: { message?: string } }) => {
         onError(String(event?.error?.message ?? 'Failed to load 3D tiles.'))
       }) as never}
@@ -118,6 +126,8 @@ function TilesScene({ apiKey, lat, lon, remountKey, onError }: TilesSceneProps) 
         plugin={ReorientationPlugin}
         args={[{ lat, lon, height: 0, recenter: true }] as never}
       />
+      <TilesPlugin plugin={TilesFadePlugin} />
+      <TilesPlugin plugin={UnloadTilesPlugin} />
       <TilesAttributionOverlay />
     </TilesRenderer>
   )
@@ -126,7 +136,13 @@ function TilesScene({ apiKey, lat, lon, remountKey, onError }: TilesSceneProps) 
 // The reoriented globe puts the ellipsoid surface at the origin, but the real ground sits below
 // it by the local geoid offset (~30m in Florida). This raycasts down onto the loaded tiles to
 // find the actual roof/ground height and recenters the orbit so the building fills the frame.
-function GroundSettler({ resetKey }: { resetKey: string }) {
+function GroundSettler({
+  resetKey,
+  settleDistance,
+}: {
+  resetKey: string
+  settleDistance: number
+}) {
   const { scene, camera, controls } = useThree()
   const raycaster = useRef(new Raycaster())
   const settled = useRef(false)
@@ -163,7 +179,7 @@ function GroundSettler({ resetKey }: { resetKey: string }) {
     if (dir.lengthSq() < 1e-6) dir.set(1, 0.85, 1)
     dir.normalize()
     orbit.target.set(0, groundY, 0)
-    camera.position.copy(orbit.target).addScaledVector(dir, 46)
+    camera.position.copy(orbit.target).addScaledVector(dir, settleDistance)
     orbit.update?.()
     settled.current = true
   })

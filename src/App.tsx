@@ -1,4 +1,4 @@
-import { Canvas } from '@react-three/fiber'
+import { Canvas, useThree } from '@react-three/fiber'
 import { Billboard, OrbitControls, Text } from '@react-three/drei'
 import {
   AlertTriangle,
@@ -10,8 +10,8 @@ import {
   Search,
   X,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { BufferGeometry, DoubleSide, Float32BufferAttribute } from 'three'
+import { useEffect, useMemo, useState } from 'react'
+import { BufferGeometry, DoubleSide, Float32BufferAttribute, Vector3 } from 'three'
 import './App.css'
 import { Photorealistic3DView } from './components/Photorealistic3DView'
 import { getCostScenario } from './lib/costModel'
@@ -55,6 +55,16 @@ function App() {
     () => analysis?.planes.find((plane) => plane.id === selectedFacetId),
     [analysis, selectedFacetId],
   )
+
+  const buildingRadius = useMemo(() => {
+    const box = solarPackage?.buildingInsights?.boundingBox
+    if (!box) return undefined
+    const latMeters = Math.abs(box.ne.lat - box.sw.lat) * 111_320
+    const avgLat = (box.ne.lat + box.sw.lat) / 2
+    const lngMeters =
+      Math.abs(box.ne.lng - box.sw.lng) * 111_320 * Math.cos((avgLat * Math.PI) / 180)
+    return Math.sqrt(latMeters ** 2 + lngMeters ** 2) / 2
+  }, [solarPackage])
 
   const costScenario: CostScenario = useMemo(
     () => getCostScenario(monthlyProperties, commercialFallbackRate),
@@ -231,16 +241,21 @@ function App() {
           </div>
           <div className="viewer">
             {location && apiKey && viewMode === 'photo' ? (
-              <Photorealistic3DView location={location} apiKey={apiKey} />
+              <Photorealistic3DView
+                location={location}
+                apiKey={apiKey}
+                buildingRadius={buildingRadius}
+              />
             ) : analysis ? (
               <>
                 <Canvas
-                  camera={{ position: [60, 50, 60], fov: 45, near: 0.1, far: 1000 }}
+                  camera={{ position: [40, 32, 40], fov: 45, near: 0.1, far: 2000 }}
                   onPointerMissed={() => setSelectedFacetId(undefined)}
                 >
                   <ambientLight intensity={0.7} />
                   <directionalLight position={[40, 80, 30]} intensity={1.3} />
                   <directionalLight position={[-40, 30, -20]} intensity={0.5} />
+                  <DiagramAutoFit analysis={analysis} />
                   <group rotation={[-Math.PI / 2, 0, 0]}>
                     {analysis.planes.some((plane) => plane.polygon3D?.length) ? (
                       analysis.planes.map((plane) => (
@@ -506,34 +521,89 @@ function PlaneMesh({
     return next
   }, [plane])
 
+  const outlineGeometry = useMemo(() => {
+    const polygon = plane.polygon3D
+    if (!polygon || polygon.length < 3) return undefined
+    const points: number[] = []
+    // Lift slightly above the surface to avoid z-fighting with the fill.
+    for (const p of polygon) points.push(p.x, p.y, p.z + 0.06)
+    const next = new BufferGeometry()
+    next.setAttribute('position', new Float32BufferAttribute(points, 3))
+    return next
+  }, [plane])
+
   if (!geometry) return null
 
   return (
-    <mesh
-      geometry={geometry}
-      onClick={(event) => {
-        event.stopPropagation()
-        onSelect()
-      }}
-      onPointerOver={(event) => {
-        event.stopPropagation()
-        document.body.style.cursor = 'pointer'
-      }}
-      onPointerOut={() => {
-        document.body.style.cursor = 'auto'
-      }}
-    >
-      <meshStandardMaterial
-        color={plane.color}
-        roughness={0.55}
-        metalness={0.05}
-        flatShading
-        side={DoubleSide}
-        emissive={isSelected ? plane.color : '#000000'}
-        emissiveIntensity={isSelected ? 0.4 : 0}
-      />
-    </mesh>
+    <group>
+      <mesh
+        geometry={geometry}
+        onClick={(event) => {
+          event.stopPropagation()
+          onSelect()
+        }}
+        onPointerOver={(event) => {
+          event.stopPropagation()
+          document.body.style.cursor = 'pointer'
+        }}
+        onPointerOut={() => {
+          document.body.style.cursor = 'auto'
+        }}
+      >
+        <meshStandardMaterial
+          color={plane.color}
+          roughness={0.65}
+          metalness={0.05}
+          flatShading
+          side={DoubleSide}
+          emissive={isSelected ? plane.color : '#000000'}
+          emissiveIntensity={isSelected ? 0.45 : 0}
+        />
+      </mesh>
+      {outlineGeometry && (
+        <lineLoop geometry={outlineGeometry}>
+          <lineBasicMaterial color={isSelected ? '#ffffff' : '#0f172a'} />
+        </lineLoop>
+      )}
+    </group>
   )
+}
+
+// Positions the camera to frame the analyzed roof regardless of building size.
+function DiagramAutoFit({ analysis }: { analysis: RoofAnalysisResult }) {
+  const { camera, controls } = useThree()
+
+  useEffect(() => {
+    const points: Vector3[] = []
+    for (const plane of analysis.planes) {
+      for (const p of plane.polygon3D ?? []) {
+        // Mesh coords (x, y, z) sit inside a group rotated -90° about X => world (x, z, -y).
+        points.push(new Vector3(p.x, p.z, -p.y))
+      }
+    }
+    if (points.length === 0) return
+
+    const center = points
+      .reduce((acc, p) => acc.add(p), new Vector3())
+      .divideScalar(points.length)
+    let radius = 8
+    for (const p of points) {
+      radius = Math.max(radius, p.distanceTo(center))
+    }
+
+    const distance = Math.max(radius * 2.4, 16)
+    const dir = new Vector3(1, 0.75, 1).normalize()
+    camera.position.copy(center).addScaledVector(dir, distance)
+    camera.lookAt(center)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orbit = controls as any
+    if (orbit?.target) {
+      orbit.target.copy(center)
+      orbit.update?.()
+    }
+  }, [analysis, camera, controls])
+
+  return null
 }
 
 function FacetDetailsCard({ plane, onClose }: { plane: RoofPlane; onClose: () => void }) {
